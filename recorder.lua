@@ -1,4 +1,4 @@
--- Slash Observation Recorder 0.2.0
+-- Slash Observation Recorder 0.3.0
 -- Run through the user's client Lua environment, or as a Studio LocalScript.
 -- Passive Roblox observations only. Optional file/clipboard export is capability-tested.
 -- No gameplay remote calls, hooks, movement, purchases, or credential handling.
@@ -18,12 +18,13 @@ if playerGui:FindFirstChild("SlashObservationRecorder") then
     return
 end
 
-local VERSION = "0.2.0"
-local MAX_RECORDS, MAX_BYTES = 1000, 4000000
+local VERSION = "0.3.0"
+local MAX_RECORDS, MAX_BYTES = 10000, 4000000
 local rows, connections, bindings = {}, {}, {}
 local seq, bytes, dropped, truncations = 0, 0, 0, 0
 local running, lastState = true, nil
 local incomingEvents, lastHeartbeat = 0, os.clock()
+local baseline
 -- These optional capabilities belong to the user's runtime. Never assume they exist.
 local fileWriter = type(writefile) == "function" and writefile or nil
 local fileReader = type(readfile) == "function" and readfile or nil
@@ -102,6 +103,7 @@ local function record(kind, data)
         bytes = bytes - rows[1].size; table.remove(rows, 1); dropped = dropped + 1
     end
     if statusLabel then statusLabel.Text = #rows .. " records / " .. dropped .. " dropped / " .. truncations .. " truncations" end
+    return row
 end
 local function resolve(root, path)
     local item = root
@@ -173,8 +175,8 @@ local function refreshBindings()
                     incomingEvents = incomingEvents + 1
                     local args = table.pack(...)
                     record("incoming-event", { path = key, args = args })
-                    -- Event-time state may precede inventory replication. Poll snapshots provide later evidence.
-                    record("event-snapshot", { path = key, state = snapshot() })
+                    -- Preserve event payloads, but do not clone entire inventories per event.
+                    -- Two-second changed-state polls and explicit markers capture state separately.
                 end)
                 bindings[key] = { instance = item, connection = connection }
                 record("coverage", { path = key, status = "subscribed; earlier events not captured" })
@@ -225,8 +227,9 @@ close.Activated:Connect(function() exportFrame.Visible = false end)
 local function exportJSON()
     local values = {}; for _, row in ipairs(rows) do table.insert(values, row.value) end
     local payload = { schemaVersion = 1, kind = "slash-recorder", session = session, exportedAt = DateTime.now():ToIsoDate(),
-        records = values, coverage = coverage, health = health(), droppedRecords = dropped, truncations = truncations,
-        limitations = { "No outgoing calls captured", "No earlier events replayed", "Replication is client-visible evidence", "Periodic state sampling is every two seconds", "No complete multi-world drop enumeration" } }
+        records = values, baseline = baseline, coverage = coverage, health = health(), droppedRecords = dropped, truncations = truncations,
+        retention = { maxRecords = MAX_RECORDS, maxEncodedRecordBytes = MAX_BYTES, baselineRetainedSeparately = true },
+        limitations = { "No outgoing calls captured", "No earlier events replayed", "Replication is client-visible evidence", "State is sampled every two seconds and on explicit markers, not per incoming event", "No complete multi-world drop enumeration" } }
     return Http:JSONEncode(payload)
 end
 exportButton.Activated:Connect(function() output.Text = exportJSON(); exportFrame.Visible = true end)
@@ -274,7 +277,9 @@ end))
 table.insert(connections, player.CharacterAdded:Connect(function() record("character-added", {}) end))
 record("started", session)
 refreshBindings()
-record("initial-snapshot", { state = snapshot() })
+local initialState = snapshot()
+baseline = record("initial-snapshot", { state = initialState })
+lastState = Http:JSONEncode(initialState)
 record("diagnostic", { label = "startup", health = health(), state = snapshot() })
 task.spawn(function()
     while running and gui.Parent do

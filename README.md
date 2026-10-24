@@ -1,6 +1,6 @@
 # Slash Observation Recorder
 
-A passive client recorder for the unresolved game-contract questions in +1 Slash Per Click (place `101558013317432`). Version **0.2.0**.
+A passive client recorder for the unresolved game-contract questions in +1 Slash Per Click (place `101558013317432`). Version **0.3.0**.
 
 The source lives in this repository. Captured account details and gameplay logs stay in local exports; the recorder does not upload them.
 
@@ -12,7 +12,7 @@ Join the actual published game, wait for it to load, then run:
 loadstring(game:HttpGet("https://raw.githubusercontent.com/umhellolol/slash-observation-recorder/main/recorder.lua"))()
 ```
 
-This requires the existing runtime to provide HTTP fetching and Lua execution. Runtime compatibility still needs a real client check. No GitHub token is required. The source can also run as a client LocalScript in a developer-controlled Studio test place; an incomplete saved place cannot reproduce missing production server behavior.
+This requires the existing runtime to provide HTTP fetching and Lua execution. Version 0.2.0 has been exercised in a user-provided live Potassium session. Version 0.3.0 changes retention and still needs its follow-up live check. No GitHub token is required. The source can also run as a client LocalScript in a developer-controlled Studio test place; an incomplete saved place cannot reproduce missing production server behavior.
 
 The `main` URL follows updates. Use a commit hash instead of `main` to pin the exact source used in an experiment. The capture includes a recorder version, but you should also retain the launch URL/commit with the exported evidence.
 
@@ -33,7 +33,7 @@ The first successful capture proves recorder operation only. Live incoming-event
 
 - Incoming Effects, TradeRemote, SwordDropEvent, CharmShopRequest, CharmShowerVisuals, Admin Blade Event, PetInventoryResult and LuckyBlockOpenResult messages when visible.
 - Client-visible stats, sword quantities and attributes, charm quantities, pet inventory, relevant account attributes, SwordDropState and AdminBladeState.
-- Initial and event-time snapshots, changed state sampled every two seconds, ten-second heartbeats, local prompt-triggered notifications and character replacement.
+- A separately preserved initial baseline, changed state sampled every two seconds, ten-second heartbeats, local prompt-triggered notifications and character replacement.
 - Manual **Before**, **Action** and **After** markers; set the experiment label in the panel.
 
 It sends no gameplay remote calls and does not move the character, collect items, trade, purchase, alter inventory or intercept outgoing calls. Fetching this source from GitHub happens in the launcher. File and clipboard exports happen only when their buttons are pressed.
@@ -44,7 +44,9 @@ It sends no gameplay remote calls and does not move the character, collect items
 
 The source bindings come from a captured client build. They may differ in the current live game. Earlier events are not replayed and no sync requests are sent. Missing or streamed-out information remains unknown. The recorder does not enumerate every drop in every world or inspect hidden server scripts.
 
-A rolling buffer retains at most 1,000 records and approximately four million encoded bytes. `droppedRecords`, sequence gaps and `truncations` expose losses and serialization limits. Long sessions, event bursts or large inventories can lose evidence; keep capture checks and individual experiments short, and export each run.
+Version 0.3.0 preserves every incoming payload but removes the repeated full inventory snapshot formerly attached to each message. Explicit markers and changed-state polling still capture inventories; state is no longer sampled on every event. A startup baseline is exported separately even if its original rolling record is evicted.
+
+A rolling buffer retains at most 10,000 records and approximately four million encoded bytes. `droppedRecords`, sequence gaps and `truncations` expose losses and serialization limits. Long sessions, event bursts or large inventories can lose evidence; keep capture checks and individual experiments short, and export each run.
 
 Snapshots can precede delayed replication and polling can miss brief transitions. Inventory folders may be absent or truncated. Client events, UI messages and object disappearance are observations, not automatic proof of ownership, successful trades or reward collection. Logs are editable JSON, not signed audit records.
 
@@ -56,4 +58,4 @@ This Lua script is the **in-game agent/observer**. A future external desktop con
 
 ## Validation status
 
-Syntax checks, a no-gameplay-server-call check, and simulated Lua lifecycle checks cover startup, subscriptions, heartbeat, event recording, quantity snapshots, optional export APIs, and stop behavior. The companion evidence workbench has focused logic and browser checks. **No live Roblox/Potassium compatibility or game behavior has yet been verified.**
+Syntax checks, a no-gameplay-server-call check, and simulated Lua lifecycle checks cover startup, subscriptions, heartbeat, event recording, quantity snapshots, optional export APIs, and stop behavior. The companion evidence workbench has focused logic and browser checks. A user-supplied v0.2.0 live capture confirms incoming-event reception, replicated state access and usable JSON export in one Potassium session. It also exposed rapid buffer eviction caused by repeated inventory snapshots. Simulated v0.3.0 tests include 2,500 ambient events without eviction. The retention correction still needs a follow-up live run, and Blade, trade, collection and reset rules remain unverified.
