@@ -1,0 +1,6 @@
+slash-capture-*.json
+*capture*.json
+*.log
+.env
+.env.*
+node_modules/
