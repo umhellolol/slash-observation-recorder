@@ -1,4 +1,4 @@
--- Slash In-Game Test Suite 1.1.0. Source only; captured data is never uploaded.
+-- Slash In-Game Test Suite 1.2.0. Source only; captured data is never uploaded.
 -- mxssyo is the preferred test account. No second instrumented client is required.
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -22,7 +22,7 @@ for _, host in ipairs(uiHosts) do
 end
 if playerGui:FindFirstChild("SlashObservationRecorder") then warn("Older recorder is still present. Stop it to avoid duplicate recordings; this suite has its own recorder.") end
 
-local Lab = { version = "1.1.0", running = true, expectedMain = "mxssyo", selectedTestId = nil,
+local Lab = { version = "1.2.0", running = true, expectedMain = "mxssyo", selectedTestId = nil,
     experiment = "mxssyo-001", notes = "", preserveLanes = true, trials = {}, results = {}, simulation = {},
     message = "Ready. Start with Survey, then choose a test. No gameplay mutations run automatically." }
 local writer = type(writefile) == "function" and writefile or nil
@@ -46,6 +46,11 @@ local probes, ambientCounts, ambientSamples, prepared = {}, {}, {}, nil
 local scanDrops, scanAnchors, instanceIds, nextInstanceId = {}, {}, setmetatable({}, { __mode = "k" }), 0
 local record, snapshot, persist
 local requestsSent = 0
+local wallRevision, laneInvalidation = 0, 0
+local function invalidateWalls(reason, invalidatesLane)
+    wallState.fresh = false; wallState.staleReason = reason
+    if invalidatesLane then laneInvalidation = laneInvalidation + 1 end
+end
 local function checklistResult(trial)
     local result = Lab.results[trial.testId]
     if not result or result.trialId ~= trial.id then
@@ -178,6 +183,7 @@ local function attrs(name, missing)
     return item:GetAttributes()
 end
 snapshot = function()
+    if wallState.observerWorld ~= world() then invalidateWalls("world changed", false) end
     local missing = {}
     local observedShower = {}
     for id, drop in pairs(shower) do
@@ -368,12 +374,18 @@ local function receive(key, args)
     if name == "Effects" then
         if first == "PersonalWallsInit" then
             wallState = Model.wallInit(args[2], args[3], args[4], args[5], serverTime())
-        elseif first == "PersonalWallsReset" then wallState = { clearedStages = {}, segments = {}, lastUpdate = serverTime() }
-        elseif first == "PersonalStageClear" then wallState.clearedStages[tostring(args[2])] = true; wallState.lastUpdate = serverTime()
-        elseif first == "PersonalWallBreak" then wallState.segments[tostring(args[2]) .. ":" .. tostring(args[3])] = { broken = true }
+            wallRevision = wallRevision + 1
+            wallState.fresh = true; wallState.observerWorld = world(); wallState.initRevision = wallRevision; wallState.initMonotonic = os.clock(); wallState.source = "PersonalWallsInit"
+        elseif first == "PersonalWallsReset" then
+            wallState = { clearedStages = {}, segments = {}, lastUpdate = serverTime() }; invalidateWalls("wall reset", true)
+        elseif first == "PersonalStageClear" then wallState.clearedStages[tostring(args[2])] = true; wallState.lastUpdate = serverTime(); laneInvalidation = laneInvalidation + 1
+        elseif first == "PersonalWallBreak" then wallState.segments[tostring(args[2]) .. ":" .. tostring(args[3])] = { broken = true }; laneInvalidation = laneInvalidation + 1
         elseif first == "PersonalWallHealth" or first == "PersonalWallActivate" then
             wallState.segments[tostring(args[2]) .. ":" .. tostring(args[3])] = { health = args[4], maxHealth = args[5], kind = first }
-        elseif first == "WorldTeleportPrepared" then prepared = { world = args[2], position = args[3], at = os.clock() } end
+        elseif first == "WorldTeleportPrepared" then prepared = { world = args[2], position = args[3], at = os.clock() }; invalidateWalls("travel preparation", false)
+        elseif first == "WorldTeleported" then invalidateWalls("travel completed; refresh needed", false)
+        elseif first == "Rebirth" and args[2] == player then invalidateWalls("local rebirth", true)
+        elseif first == "Message" and type(args[2]) == "string" and string.match(args[2], "^%+.*Wins!$") then invalidateWalls("reward claim", true) end
         if first == "PersonalWallsInit" then probeResponse("wall_sync") end
     elseif name == "SwordDropEvent" then
         if first == "Incoming" or first == "Impact" or first == "Collected" then
@@ -505,7 +517,7 @@ function Lab.command(id, args)
     busy = true
     local requestsBefore = requestsSent
     if activeTrial and action.risk ~= "read" then
-        activeTrial.afterSeq = nil; activeTrial.evidenceSaved = false
+        activeTrial.afterSeq = nil; activeTrial.evidenceSaved = false; activeTrial.status = "RUNNING"
         local result = checklistResult(activeTrial); result.captured = false; result.saved = false; result.status = "RUNNING"
     end
     local ok, err = pcall(function()
@@ -611,13 +623,14 @@ function Lab.command(id, args)
         record("command-blocked-or-uncertain", { action = id, reason = tostring(err), checklistStatus = status })
         if activeTrial then
             activeTrial.lastIssue = { status = status, reason = tostring(err), action = id }
-            local result = checklistResult(activeTrial); result.status = status; result.notes = tostring(err)
+            local result = checklistResult(activeTrial); result.status = status; result.notes = tostring(err); result.commandStatus = status; result.commandReason = tostring(err)
         end
         return notify(err)
     end
-    if activeTrial then
+    if activeTrial and action.risk ~= "read" then
         activeTrial.lastIssue = nil
         local result = checklistResult(activeTrial)
+        result.commandStatus = "ISSUED"; result.commandReason = nil
         if result.status == "BLOCKED" or result.status == "ERROR" then result.status = "RUNNING"; result.notes = "" end
     end
     Lab.message = action.label .. ": request recorded. Check responses and resulting state; no automatic PASS."
@@ -640,7 +653,13 @@ end
 function Lab.startTrial()
     if not Lab.running then return notify("Suite stopped.") end
     if not Lab.selectedTestId then return notify("Select a test first.") end
-    if activeTrial then activeTrial.status = activeTrial.status == "RUNNING" and "OBSERVED" or activeTrial.status; activeTrial.endedAt = now() end
+    if activeTrial then
+        if activeTrial.status == "RUNNING" then
+            activeTrial.status = activeTrial.afterSeq and "OBSERVED" or "INCOMPLETE"
+            local previousResult = checklistResult(activeTrial); previousResult.status = activeTrial.status
+        end
+        activeTrial.endedAt = now()
+    end
     local group
     for _, test in ipairs(Lab.tests or {}) do if test.id == Lab.selectedTestId then group = test.group end end
     activeTrial = { id = Http:GenerateGUID(false), testId = Lab.selectedTestId, experiment = Lab.experiment, startedAt = now(), status = "RUNNING", notes = Lab.notes, markers = {},
@@ -657,12 +676,13 @@ function Lab.mark(phase)
     if phase ~= "before" and phase ~= "action" and phase ~= "after" and phase ~= "note" then return notify("Unknown marker phase.") end
     activeTrial.phase = phase
     if phase == "action" or phase == "before" then
-        activeTrial.lastIssue = nil; activeTrial.afterSeq = nil; activeTrial.evidenceSaved = false
+        activeTrial.lastIssue = nil; activeTrial.afterSeq = nil; activeTrial.evidenceSaved = false; activeTrial.status = "RUNNING"
         local result = checklistResult(activeTrial); result.status = "RUNNING"; result.notes = ""; result.saved = false; result.captured = false
     end
     local r = capture(phase, { label = Lab.experiment })
     if r then
         activeTrial.markers[#activeTrial.markers + 1] = { phase = phase, seq = r.seq, notes = Lab.notes }
+        if phase == "before" then activeTrial.baseline = cache; activeTrial.beforeSeq = r.seq; activeTrial.observedDelta = nil; Lab.lastDelta = nil end
         if phase == "after" then
             activeTrial.afterSeq = r.seq
             local previous = activeTrial.baseline or {}
@@ -678,10 +698,12 @@ function Lab.mark(phase)
                 for key in pairs(previous.pets) do if not cache.pets[key] then delta.petsRemoved[#delta.petsRemoved + 1] = key end end
             end
             activeTrial.observedDelta = delta; Lab.lastDelta = delta; record("trial-observed-delta", delta)
-            activeTrial.status = activeTrial.lastIssue and activeTrial.lastIssue.status or "OBSERVED"
+            activeTrial.status = "OBSERVED"
             local result = checklistResult(activeTrial)
             result.status = activeTrial.status; result.captured = true; result.saved = false
-            result.notes = activeTrial.lastIssue and activeTrial.lastIssue.reason or Lab.notes
+            result.notes = Lab.notes
+            result.commandStatus = activeTrial.lastIssue and activeTrial.lastIssue.status or result.commandStatus
+            result.commandReason = activeTrial.lastIssue and activeTrial.lastIssue.reason or result.commandReason
         end
     end
     Lab.message = phase .. " captured."
@@ -707,6 +729,28 @@ function Lab.survey()
     Lab.message = "Survey captured; read-only shop/wall/shower requests attempted. Inspect response windows; an empty event state is not a failure."
     return true
 end
+
+-- Fresh response windows for the focused lane check. No server correlation ID exists.
+function Lab.refreshWalls()
+    if not Lab.running then return false, "Recording has stopped." end
+    local requestedWorld, revision = world(), wallRevision
+    invalidateWalls("refresh requested", false)
+    local ok, why = Lab.command("wall_sync", {})
+    if not ok then return false, why end
+    local deadline = os.clock() + 8
+    while Lab.running and wallRevision == revision and os.clock() < deadline do task.wait(0.1) end
+    if not Lab.running or world() ~= requestedWorld or wallRevision == revision or not wallState.fresh or wallState.observerWorld ~= requestedWorld then
+        return false, "No fresh lane response. Stay in this world and try again."
+    end
+    local s = snapshot()
+    local config = loadConfig("PunchEscapeConfig")
+    local area = config and config.Worlds and config.Worlds[requestedWorld]
+    return true, { state = s, firstStage = area and area.FirstStage, lastStage = area and area.LastStage,
+        jobId = game.JobId, invalidation = laneInvalidation, revision = wallRevision,
+        scope = "Fresh PersonalWallsInit observed in request window; no protocol correlation ID." }
+end
+function Lab.laneEvidence(kind, details) return record("lane-" .. kind, details) end
+function Lab.laneValidity() return { jobId = game.JobId, invalidation = laneInvalidation, world = world(), running = Lab.running } end
 function Lab.replay()
     local out = {}
     local function test(id, fn)
@@ -755,7 +799,7 @@ function Lab.view()
     for _, test in ipairs(Lab.tests or {}) do
         local result = Lab.results[test.id]
         if not result or result.status == "NOT_RUN" then caseCounts.notRun = caseCounts.notRun + 1
-        elseif result.status == "RUNNING" then caseCounts.running = caseCounts.running + 1
+        elseif result.status == "RUNNING" or result.status == "INCOMPLETE" then caseCounts.running = caseCounts.running + 1
         elseif result.status == "PASS" then caseCounts.passed = caseCounts.passed + 1
         elseif result.status == "FAIL" then caseCounts.failed = caseCounts.failed + 1
         elseif result.status == "BLOCKED" then caseCounts.blocked = caseCounts.blocked + 1
@@ -784,7 +828,7 @@ function Lab.exportJSON()
     return Http:JSONEncode({ schemaVersion = 1, kind = "slash-recorder", session = session, records = all, baseline = baseline,
         coverage = coverage, exportedAt = now(), droppedRecords = lost, truncations = truncations, evictedFromMemory = evicted,
         segmentManifest = segments, unreadableSegments = unreadable, fullHistoryReassembled = reader ~= nil and #unreadable == 0 and lost == 0,
-        tests = Lab.tests, trials = Lab.trials, results = Lab.results, simulation = Lab.simulation, probes = probes,
+        tests = Lab.tests, trials = Lab.trials, results = Lab.results, simulation = Lab.simulation, probes = probes, guidedLane = Lab.laneReport,
         filteredAmbientEvents = filtered, ambientCounts = ambientCounts, configurationStatus = configStatus,
         health = { running = Lab.running, incomingEvents = incoming, retainedRecords = #all, droppedRecords = lost, truncations = truncations, subscribedRoutes = countTable(bindings), totalRoutes = #routes },
         limitations = { "Only this account is instrumented", "Only tool-originated outgoing requests are logged", "Manual game UI actions need markers for intent", "Empty or streamed-out drops do not prove absence", "Simulation is not live server evidence", "Physical reward-pad touches outside this suite cannot be blocked by its preserve setting" } })
@@ -799,6 +843,7 @@ function Lab.save()
     end)
     if not ok then return notify(result) end
     Lab.message = "Exported " .. result .. ". Keep segment files until the complete file is checked."
+    Lab.lastSaveFilename = result
     return true, Lab.message
 end
 function Lab.copy()
@@ -826,7 +871,7 @@ table.insert(connections, PromptService.PromptTriggered:Connect(function(prompt,
 end))
 table.insert(connections, Players.PlayerAdded:Connect(function(p) record("player-joined", { username = p.Name, userId = p.UserId }) end))
 table.insert(connections, Players.PlayerRemoving:Connect(function(p) record("player-left", { username = p.Name, userId = p.UserId }) end))
-table.insert(connections, player.CharacterAdded:Connect(function() record("character-added", { world = world() }) end))
+table.insert(connections, player.CharacterAdded:Connect(function() invalidateWalls("character respawn", true); record("character-added", { world = world() }) end))
 local lastHeartbeat, lastScan = os.clock(), os.clock()
 task.spawn(function()
     while Lab.running do
@@ -1056,325 +1101,225 @@ local TESTS = {
 
 Lab.tests = TESTS
 
-Lab.selectTest("T10")
+Lab.selectTest("T01")
 
--- Slash single-account evidence suite UI.
--- This part is intentionally service-agnostic: engine.lua owns Lab and catalog.lua owns Lab.tests.
+-- One user-facing lane experiment. The full evidence catalog remains in exports.
+local lane = { step = 1, busy = false, message = "Ready when you are.", done = {} }
+Lab.laneReport = lane
+local function laneState() return Lab.view().snapshot end
+local function automationOff(s)
+    return s.playerAttributes and s.playerAttributes.AutoWin and s.playerAttributes.AutoWin.value == false
+        and s.playerStats and s.playerStats.AutoRebirth == false and s.playerStats.AFKPad == 0
+end
+local function healthy(s) return s.characterPresent and type(s.characterHealth) == "number" and s.characterHealth > 0 end
+local function validTrip()
+    local v = Lab.laneValidity()
+    return v.running and v.jobId == lane.jobId and v.invalidation == lane.invalidation
+        and healthy(laneState()) and automationOff(laneState())
+end
+local function finishLane(result, message)
+    lane.result = result; lane.message = message; lane.step = 5; lane.done[4] = true
+    Lab.laneEvidence("result", { result = result, message = message, origin = lane.origin, destination = lane.destination,
+        departure = lane.departure, returned = lane.returned, jobId = lane.jobId,
+        scope = "This observed lane and round trip only. No universal server certification." })
+    Lab.mark("after")
+    -- Keep observed mechanics separate from the last attempted command and file status.
+    if Lab.results.T01 then Lab.results.T01.mechanicResult = result end
+end
+function Lab.laneView()
+    local titles = { "Start in the world you want to test", "Clear this world's lane", "Travel away and return", "Check the returned lane", "Save your result" }
+    local instructions = {
+        "Start will turn off Auto Win and Auto Rebirth. Leave training first. Keep this game server open throughout the test.",
+        "Clear the whole lane normally. Do not touch the Wins reward pad. Then press the button below.",
+        "The next button travels to another unlocked world and brings you back. Do not claim rewards or rebirth during the trip.",
+        "Stay in the returned world. The next button reads fresh lane information and compares it with before the trip.",
+        "Save the result, then send the saved JSON file here. An incomplete result is still useful."
+    }
+    local buttons = { "Start test", "I've cleared the lane", "Travel away and back", "Check my lane", "Save result" }
+    local labels = { "Test started", "Cleared lane recorded", "Travelled away and back", "Result recorded", "Result saved" }
+    local checks = {}; for i, label in ipairs(labels) do checks[i] = { label = label, state = lane.done[i] and "done" or "pending" } end
+    return { step = lane.step, title = titles[lane.step], instruction = instructions[lane.step], button = buttons[lane.step],
+        status = lane.message, message = lane.message, busy = lane.busy, checks = checks, filename = Lab.lastSaveFilename,
+        result = lane.result }
+end
+function Lab.laneAction()
+    if lane.busy then return false, "Please wait for this step to finish." end
+    if not Lab.running then lane.message = "Recording has stopped. Save progress before closing."; return false, lane.message end
+    lane.busy = true
+    local ok, success, message = pcall(function()
+        if lane.step == 1 then
+            local s = laneState()
+            if not healthy(s) then return false, "Wait for your character to load, then try again." end
+            if not s.playerStats or s.playerStats.AFKPad ~= 0 then return false, "Leave training, then press Start test again." end
+            if type(s.maxWorldUnlocked) ~= "number" or s.maxWorldUnlocked < 2 then return false, "This test needs two unlocked worlds." end
+            if s.trade and s.trade.active then return false, "Finish or cancel your trade first." end
+            Lab.selectTest("T01"); Lab.setExperiment("mxssyo-lane-check"); Lab.startTrial(); Lab.setPreserve(true)
+            local deadline = os.clock() + 6
+            while Lab.running and not automationOff(laneState()) and os.clock() < deadline do task.wait(0.1) end
+            if not automationOff(laneState()) then return false, "Auto Win or Auto Rebirth is still on. Turn them off in the game, then try again." end
+            lane.origin = laneState().world; lane.jobId = Lab.laneValidity().jobId
+            lane.destination = lane.origin == 1 and 2 or 1
+            lane.done[1] = true; lane.step = 2
+            Lab.laneEvidence("started", { origin = lane.origin, destination = lane.destination, jobId = lane.jobId })
+            return true, "Clear the lane without claiming the Wins reward."
+        elseif lane.step == 2 then
+            local v = Lab.laneValidity()
+            if v.jobId ~= lane.jobId or v.world ~= lane.origin then return false, "Return to the world where you started, then try again." end
+            if not healthy(laneState()) or not automationOff(laneState()) then return false, "Leave training and turn off Auto Win and Auto Rebirth first." end
+            local good, response = Lab.refreshWalls()
+            if not good then return false, "Couldn't read fresh lane information. Stay here and press the button again." end
+            if type(response.firstStage) ~= "number" or type(response.lastStage) ~= "number" then return false, "Couldn't identify this world's lane. Save progress so I can inspect it." end
+            local cleared, missing = response.state.walls.clearedStages or {}, 0
+            for stage = response.firstStage, response.lastStage do if not cleared[tostring(stage)] then missing = missing + 1 end end
+            if missing > 0 then return false, "The lane isn't fully cleared yet. Finish the walls without touching the reward pad, then try again." end
+            lane.departure = response; lane.invalidation = response.invalidation
+            Lab.mark("before"); Lab.laneEvidence("departure", response)
+            lane.done[2] = true; lane.step = 3
+            return true, "Cleared lane recorded. Ready for the round trip."
+        elseif lane.step == 3 then
+            if not validTrip() or Lab.laneValidity().world ~= lane.origin then
+                finishLane("INCONCLUSIVE", "The starting state changed. Save this result so I can review it."); return false, lane.message
+            end
+            local travelled = Lab.command("travel", { world = lane.destination })
+            if not travelled or not validTrip() or Lab.laneValidity().world ~= lane.destination then
+                finishLane("INCONCLUSIVE", "The trip didn't complete cleanly. Stay where you are and save the result."); return false, lane.message
+            end
+            Lab.laneEvidence("away", Lab.laneValidity())
+            local returned = Lab.command("travel", { world = lane.origin })
+            if not returned or not validTrip() or Lab.laneValidity().world ~= lane.origin then
+                finishLane("INCONCLUSIVE", "The return couldn't be confirmed. Save the result; don't repeat the trip yet."); return false, lane.message
+            end
+            lane.done[3] = true; lane.step = 4
+            Lab.laneEvidence("returned", Lab.laneValidity())
+            return true, "You're back. Check the lane now."
+        elseif lane.step == 4 then
+            if not validTrip() or Lab.laneValidity().world ~= lane.origin then
+                finishLane("INCONCLUSIVE", "The test state changed. Save the result so I can review it."); return false, lane.message
+            end
+            local good, response = Lab.refreshWalls()
+            if not good then return false, "No fresh lane response yet. Stay here and check again." end
+            if not validTrip() or response.jobId ~= lane.jobId or response.state.world ~= lane.origin then
+                finishLane("INCONCLUSIVE", "The state changed while checking. Save the result."); return false, lane.message
+            end
+            lane.returned = response
+            local missing = {}
+            for stage = lane.departure.firstStage, lane.departure.lastStage do
+                if not response.state.walls.clearedStages[tostring(stage)] then missing[#missing + 1] = stage end
+            end
+            lane.missingAfterReturn = missing
+            if #missing == 0 then finishLane("PASS", "Passed: your cleared lane stayed open after the round trip.")
+            else finishLane("FAIL", "The lane changed after returning. Save the result so I can inspect what reset.") end
+            return true, lane.message
+        elseif lane.step == 5 then
+            local good = Lab.save()
+            if not good then return false, "Couldn't save the file. Keep the window open and try Save result again." end
+            lane.done[5] = true
+            -- Save again so the complete export includes the verified save-state flag.
+            local savedAgain = Lab.save()
+            if not savedAgain then lane.done[5] = false; return false, "Couldn't finish saving. Keep the window open and try again." end
+            return true, "Saved. Send the JSON file shown below here."
+        end
+    end)
+    lane.busy = false
+    if not ok then
+        Lab.laneEvidence("error", { reason = tostring(success), step = lane.step })
+        if lane.departure and (lane.step == 3 or lane.step == 4) then
+            finishLane("INCONCLUSIVE", "The trip couldn't be checked safely. Save this result; don't repeat the trip yet.")
+            return false, lane.message
+        end
+        lane.message = "This step couldn't finish. Save progress and keep the window open so I can inspect it."
+        return false, lane.message
+    end
+    lane.message = message or lane.message
+    return success, lane.message
+end
+
+-- Focused Lane Persistence test UI. engine.lua supplies Lab.laneView/laneAction/save/close.
 local function buildUI(Lab)
     local Players = game:GetService("Players")
     local UIS = game:GetService("UserInputService")
-    local RunService = game:GetService("RunService")
     local player = Players.LocalPlayer
     local gui = Instance.new("ScreenGui")
-    gui.Name = "SlashInGameTestSuite"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.DisplayOrder = 2147483647
-    local host
-    local candidates = {}
-    pcall(function() if type(gethui) == "function" then table.insert(candidates, gethui()) end end)
-    pcall(function() table.insert(candidates, game:GetService("CoreGui")) end)
-    if player then pcall(function() table.insert(candidates, player:WaitForChild("PlayerGui")) end) end
-    for _, candidate in ipairs(candidates) do
-        local ok = pcall(function() gui.Parent = candidate end)
-        if ok and gui.Parent == candidate then host = candidate; break end
-    end
-    if not host then error("Slash UI could not find a parent host") end
+    gui.Name = "SlashInGameTestSuite"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.DisplayOrder = 2147483647
+    local hosts = {}
+    pcall(function() if type(gethui) == "function" then table.insert(hosts, gethui()) end end)
+    pcall(function() table.insert(hosts, game:GetService("CoreGui")) end)
+    if player then pcall(function() table.insert(hosts, player:WaitForChild("PlayerGui")) end) end
+    for _, host in ipairs(hosts) do local ok = pcall(function() gui.Parent = host end); if ok and gui.Parent == host then break end end
+    assert(gui.Parent, "Couldn't open the lane-test window. Retry after the game finishes loading.")
     Lab.gui = gui
+    local C = {bg=Color3.fromRGB(11,18,24), panel=Color3.fromRGB(20,32,40), panel2=Color3.fromRGB(28,45,53), text=Color3.fromRGB(229,242,241), muted=Color3.fromRGB(155,180,181), mint=Color3.fromRGB(73,220,174), red=Color3.fromRGB(244,110,111)}
+    local function corner(o) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,8); c.Parent=o end
+    local function stroke(o) local s=Instance.new("UIStroke"); s.Color=Color3.fromRGB(55,78,84); s.Transparency=.2; s.Parent=o end
+    local function text(parent, value, size, color, bold)
+        local l=Instance.new("TextLabel"); l.BackgroundTransparency=1; l.Text=value or ""; l.TextColor3=color or C.text; l.Font=bold and Enum.Font.GothamMedium or Enum.Font.Gotham; l.TextSize=size or 13; l.TextWrapped=true; l.TextXAlignment=Enum.TextXAlignment.Left; l.TextYAlignment=Enum.TextYAlignment.Top; l.AutomaticSize=Enum.AutomaticSize.Y; l.Size=UDim2.new(1,0,0,24); l.Parent=parent; return l
+    end
+    local function button(parent, value, fn, color, width)
+        local b=Instance.new("TextButton"); b.Text=value; b.Font=Enum.Font.GothamMedium; b.TextSize=12; b.TextColor3=C.text; b.BackgroundColor3=color or C.panel2; b.BorderSizePixel=0; b.Size=UDim2.new(0,width or 100,0,32); b.Parent=parent; corner(b); stroke(b); if fn then b.Activated:Connect(fn) end; return b
+    end
+    local function view() local ok,v=pcall(Lab.laneView); return ok and type(v)=="table" and v or {} end
 
-    local C = {
-        bg = Color3.fromRGB(11, 18, 24), panel = Color3.fromRGB(18, 29, 37), panel2 = Color3.fromRGB(24, 38, 47),
-        line = Color3.fromRGB(45, 65, 75), text = Color3.fromRGB(229, 242, 241), muted = Color3.fromRGB(151, 177, 180),
-        mint = Color3.fromRGB(73, 220, 174), mintDark = Color3.fromRGB(22, 115, 92), amber = Color3.fromRGB(250, 189, 84),
-        red = Color3.fromRGB(244, 110, 111), blue = Color3.fromRGB(107, 184, 244)
-    }
-    local fonts = Enum.Font.Gotham
-    local compact = Enum.Font.GothamMedium
-    local selectedId = nil
-    local refs, actionInputs, caseButtons = {}, {}, {}
-    local experiment, notes
-    local function corner(o, radius)
-        local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, radius or 7); c.Parent = o
-    end
-    local function stroke(o, color)
-        local s = Instance.new("UIStroke"); s.Color = color or C.line; s.Thickness = 1; s.Transparency = .25; s.Parent = o
-    end
-    local function label(parent, text, size, color, bold)
-        local l = Instance.new("TextLabel"); l.BackgroundTransparency = 1; l.Text = text or ""; l.TextColor3 = color or C.text
-        l.Font = bold and compact or fonts; l.TextSize = size or 13; l.TextXAlignment = Enum.TextXAlignment.Left; l.TextYAlignment = Enum.TextYAlignment.Top
-        l.TextWrapped = true; l.AutomaticSize = Enum.AutomaticSize.Y; l.Size = UDim2.new(1, 0, 0, size and math.max(18, size + 6) or 24); l.Parent = parent; return l
-    end
-    local function button(parent, text, callback, color, width)
-        local b = Instance.new("TextButton"); b.AutoButtonColor = true; b.Text = text; b.Font = compact; b.TextSize = 12; b.TextColor3 = C.text
-        b.BackgroundColor3 = color or C.panel2; b.Size = UDim2.new(0, width or 108, 0, 30); b.BorderSizePixel = 0; b.Parent = parent; corner(b, 6); stroke(b)
-        if callback then b.Activated:Connect(callback) end
-        return b
-    end
-    local function field(parent, placeholder, initial)
-        local t = Instance.new("TextBox"); t.ClearTextOnFocus = false; t.PlaceholderText = placeholder or ""; t.Text = initial or ""; t.Font = fonts; t.TextSize = 12; t.TextColor3 = C.text
-        t.PlaceholderColor3 = C.muted; t.BackgroundColor3 = C.bg; t.Size = UDim2.new(1, 0, 0, 30); t.BorderSizePixel = 0; t.Parent = parent; corner(t, 5); stroke(t); return t
-    end
-    local function list(parent, gap)
-        local l = Instance.new("UIListLayout"); l.Padding = UDim.new(0, gap or 6); l.SortOrder = Enum.SortOrder.LayoutOrder; l.Parent = parent; return l
-    end
-    local function frame(parent, color, size)
-        local f = Instance.new("Frame"); f.BackgroundColor3 = color or C.panel; f.BorderSizePixel = 0; f.Size = size or UDim2.new(1, 0, 0, 0); f.Parent = parent; corner(f, 8); return f
-    end
-    local function arr(v)
-        if type(v) ~= "table" then return "" end
-        local out = {}; for i, x in ipairs(v) do out[i] = "- " .. tostring(x) end; return table.concat(out, "\n")
-    end
-    local function safeView()
-        local ok, v = pcall(function() return Lab.view() end); return ok and type(v) == "table" and v or {}
-    end
-    local function testById(id)
-        for _, t in ipairs(Lab.tests or {}) do if tostring(t.id) == tostring(id) then return t end end
-    end
-    local function statLine(v)
-        local id = v.identity or {}; local s = v.summary or {}; local snap = v.snapshot or {}
-        local stats = snap.stats or snap.playerStats or {}
-        return string.format("%s  •  %s  •  world %s  •  events %s  •  records %s", tostring(id.username or "player"), tostring(id.jobId or "server?"), tostring(snap.world or "?"), tostring(s.events or 0), tostring(s.records or 0))
-    end
-    local function caseStatus(v, id)
-        local result = (v.results or {})[id]
-        if type(result) == "table" and result.status == "OBSERVED" and result.captured and result.saved then return "SAVED" end
-        return type(result) == "table" and tostring(result.status or "NOT_RUN") or "NOT_RUN"
-    end
-    local function statusMark(status)
-        if status == "PASS" then return "[PASS]" elseif status == "FAIL" then return "[FAIL]" elseif status == "SAVED" then return "[SAVED]" elseif status == "OBSERVED" then return "[OBSERVED]" elseif status == "RUNNING" then return "[~]" elseif status == "BLOCKED" then return "[BLOCKED]" elseif status == "ERROR" then return "[ERROR]" end
-        return "[ ]"
-    end
-
-    local root = frame(gui, C.bg, UDim2.new(0, 980, 0, 650)); root.Name = "SuiteWindow"; root.AnchorPoint = Vector2.new(0, 0); root.BackgroundTransparency = .08; root.ZIndex = 2
-    local function viewportSize()
-        local camera = workspace.CurrentCamera
-        if camera and camera.ViewportSize.X > 0 then return camera.ViewportSize end
-        return Vector2.new(gui.AbsoluteSize.X > 0 and gui.AbsoluteSize.X or 1024, gui.AbsoluteSize.Y > 0 and gui.AbsoluteSize.Y or 720)
-    end
-    local function bounds()
-        local vp = viewportSize(); local minW = math.min(850, math.max(1, vp.X - 12)); local minH = math.min(520, math.max(1, vp.Y - 12))
-        return vp, minW, minH
-    end
-    local vp, minW, minH = bounds(); local normal = {x = math.max(12, (vp.X - 980) / 2), y = math.max(12, (vp.Y - 650) / 2), w = math.min(980, vp.X - 24), h = math.min(650, vp.Y - 24)}
-    normal.w = math.max(minW, normal.w); normal.h = math.max(minH, normal.h)
-    root.Position = UDim2.fromOffset(normal.x, normal.y); root.Size = UDim2.fromOffset(normal.w, normal.h)
-    local maxed, minimized, alive = false, false, true
-    local top = Instance.new("Frame"); top.Name = "SuiteTitleBar"; top.BackgroundColor3 = C.panel; top.BorderSizePixel = 0; top.Size = UDim2.new(1, 0, 0, 54); top.Parent = root
-    local title = label(top, "SLASH  /  EVIDENCE SUITE", 16, C.mint, true); title.Position = UDim2.new(0, 18, 0, 9); title.Size = UDim2.new(1, -280, 0, 22)
-    local subtitle = label(top, "single-account observation and validation", 11, C.muted, false); subtitle.Position = UDim2.new(0, 19, 0, 31); subtitle.Size = UDim2.new(1, -280, 0, 16)
+    local root=Instance.new("Frame"); root.Name="SuiteWindow"; root.Active=true; root.BackgroundColor3=C.bg; root.BorderSizePixel=0; root.Size=UDim2.fromOffset(620,520); root.Parent=gui; corner(root); stroke(root)
+    local vp=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(900,700)
+    local minW,minH=math.min(360,math.max(1,vp.X-20)),math.min(420,math.max(1,vp.Y-20))
+    local normal={x=math.max(10,(vp.X-620)/2),y=math.max(10,(vp.Y-520)/2),w=math.min(620,vp.X-20),h=math.min(520,vp.Y-20)}; normal.w=math.max(minW,normal.w); normal.h=math.max(minH,normal.h); root.Position=UDim2.fromOffset(normal.x,normal.y); root.Size=UDim2.fromOffset(normal.w,normal.h)
+    local top=Instance.new("Frame"); top.Name="SuiteTitleBar"; top.BackgroundColor3=C.panel; top.BorderSizePixel=0; top.Size=UDim2.new(1,0,0,50); top.Parent=root
+    local title=text(top,"Lane test",16,C.mint,true); title.Position=UDim2.new(0,14,0,9); title.Size=UDim2.new(1,-140,0,20)
+    local subtitle=text(top,"Clear • Travel • Check • Save",11,C.muted,false); subtitle.Position=UDim2.new(0,15,0,29); subtitle.Size=UDim2.new(1,-140,0,16)
     local body
-    local minBtn, maxBtn
-    local windowState = {x = normal.x, y = normal.y, width = normal.w, height = normal.h, minimized = false, maximized = false}
-    local function constrain()
-        local view, lowW, lowH = bounds()
-        if maxed then
-            windowState.x, windowState.y, windowState.width, windowState.height = 0, 0, view.X, view.Y
-        else
-        windowState.width = math.clamp(windowState.width, lowW, math.max(1, view.X - 12)); windowState.height = math.clamp(windowState.height, lowH, math.max(1, view.Y - 12))
-        windowState.x = math.clamp(windowState.x, 6, math.max(6, view.X - windowState.width - 6)); windowState.y = math.clamp(windowState.y, 6, math.max(6, view.Y - windowState.height - 6))
-        normal = {x=windowState.x,y=windowState.y,w=windowState.width,h=windowState.height}
-        end
-        root.Position = UDim2.fromOffset(windowState.x, windowState.y); root.Size = UDim2.fromOffset(windowState.width, minimized and 54 or windowState.height)
+    local minimized,maximized,alive=false,false,true; local state={x=normal.x,y=normal.y,w=normal.w,h=normal.h}; local previousNormal={x=normal.x,y=normal.y,w=normal.w,h=normal.h}
+    local function viewport() local c=workspace.CurrentCamera; return c and c.ViewportSize or Vector2.new(900,700) end
+    local function clamp() local v=viewport(); local lowW=math.min(360,math.max(1,v.X-12)); local lowH=math.min(420,math.max(1,v.Y-12)); if maximized then state.x,state.y,state.w,state.h=0,0,v.X,v.Y else state.w=math.clamp(state.w,lowW,math.max(lowW,v.X-12)); state.h=math.clamp(state.h,lowH,math.max(lowH,v.Y-12)); state.x=math.clamp(state.x,6,math.max(6,v.X-state.w-6)); state.y=math.clamp(state.y,6,math.max(6,v.Y-state.h-6)); previousNormal={x=state.x,y=state.y,w=state.w,h=state.h} end; root.Position=UDim2.fromOffset(state.x,state.y); root.Size=UDim2.fromOffset(state.w,minimized and 50 or state.h) end
+    local minBtn,maxBtn
+    local function apply() root.Position=UDim2.fromOffset(state.x,state.y); root.Size=UDim2.fromOffset(state.w,minimized and 50 or state.h); body.Visible=not minimized; minBtn.Text=minimized and "↗" or "—"; maxBtn.Text=maximized and "❐" or "□" end
+    local function move(x,y) if maximized then return end; state.x,state.y=x,y; clamp(); previousNormal.x,previousNormal.y=state.x,state.y end
+    local function resize(w,h) if maximized or minimized then return end; state.w,state.h=w,h; clamp(); previousNormal.w,previousNormal.h=state.w,state.h end
+    local function minimize() minimized=true; apply() end
+    local function restore() local wasMinimized=minimized; minimized=false; if maximized and not wasMinimized then maximized=false; state.x,state.y,state.w,state.h=previousNormal.x,previousNormal.y,previousNormal.w,previousNormal.h end; clamp(); apply() end
+    local function maximize() if maximized then restore(); return end; previousNormal={x=state.x,y=state.y,w=state.w,h=state.h}; local v=viewport(); maximized=true; minimized=false; state.x,state.y,state.w,state.h=0,0,v.X,v.Y; apply() end
+    Lab.windowControls={getState=function() return {x=state.x,y=state.y,width=state.w,height=state.h,minimized=minimized,maximized=maximized} end,move=move,resize=resize,minimize=minimize,maximize=maximize,restore=restore,constrain=clamp}
+    local drag=Instance.new("Frame"); drag.Name="SuiteDragZone"; drag.Active=true; drag.BackgroundTransparency=1; drag.Size=UDim2.new(1,-122,1,0); drag.Parent=top
+    maxBtn=button(top,"□",maximize,C.panel2,34); maxBtn.Name="SuiteMaximizeButton"; maxBtn.Position=UDim2.new(1,-112,0,9)
+    minBtn=button(top,"—",function() if minimized then restore() else minimize() end end,C.panel2,34); minBtn.Name="SuiteMinimizeButton"; minBtn.Position=UDim2.new(1,-74,0,9)
+    local close=button(top,"×",function() end,C.red,34); close.Name="SuiteCloseButton"; close.Position=UDim2.new(1,-36,0,9)
+    body=Instance.new("Frame"); body.BackgroundTransparency=1; body.Position=UDim2.new(0,12,0,60); body.Size=UDim2.new(1,-24,1,-70); body.Parent=root
+    local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.Size=UDim2.new(1,0,1,0); scroll.ScrollBarThickness=5; scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(); scroll.Parent=body
+    local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,9); layout.SortOrder=Enum.SortOrder.LayoutOrder; layout.Parent=scroll
+    local panel=Instance.new("Frame"); panel.BackgroundColor3=C.panel; panel.BorderSizePixel=0; panel.Size=UDim2.new(1,-4,0,0); panel.AutomaticSize=Enum.AutomaticSize.Y; panel.Parent=scroll; corner(panel); stroke(panel)
+    local content=Instance.new("Frame"); content.BackgroundTransparency=1; content.Position=UDim2.fromOffset(14,14); content.Size=UDim2.new(1,-28,0,0); content.AutomaticSize=Enum.AutomaticSize.Y; content.Parent=panel
+    local contentLayout=Instance.new("UIListLayout"); contentLayout.Padding=UDim.new(0,9); contentLayout.SortOrder=Enum.SortOrder.LayoutOrder; contentLayout.Parent=content
+    local checklist=text(content,"",12,C.text,false); checklist.LayoutOrder=1; checklist.Size=UDim2.new(1,0,0,0)
+    local instruction=text(content,"",14,C.text,true); instruction.LayoutOrder=2; instruction.Size=UDim2.new(1,0,0,0)
+    local action=button(content,"",nil,C.mint,0); action.Name="LanePrimaryButton"; action.LayoutOrder=3; action.Size=UDim2.new(1,0,0,38); action.TextColor3=Color3.fromRGB(8,30,28)
+    local status=text(content,"",11,C.muted,false); status.LayoutOrder=4; status.Size=UDim2.new(1,0,0,0)
+    local saveRow=Instance.new("Frame"); saveRow.BackgroundTransparency=1; saveRow.LayoutOrder=5; saveRow.Size=UDim2.new(1,0,0,34); saveRow.Parent=content
+    local notice
+    local save=button(saveRow,"Save progress",function() local ok,success=pcall(Lab.save); notice=ok and success and "Progress saved. You can keep testing." or "Couldn't save. Keep this window open and try again."; status.Text=notice end,C.panel2,120); save.Position=UDim2.new(0,0,0,0)
+    local filename=Instance.new("TextBox"); filename.BackgroundTransparency=1; filename.TextColor3=C.muted; filename.Font=Enum.Font.Gotham; filename.TextSize=11; filename.TextXAlignment=Enum.TextXAlignment.Left; filename.TextYAlignment=Enum.TextYAlignment.Center; filename.ClearTextOnFocus=false; filename.TextEditable=false; filename.TextWrapped=false; filename.Size=UDim2.new(1,-130,1,0); filename.Position=UDim2.new(0,130,0,0); filename.Parent=saveRow
+    local closePrompt=Instance.new("Frame"); closePrompt.BackgroundColor3=C.panel2; closePrompt.BorderSizePixel=0; closePrompt.Size=UDim2.new(1,-28,0,92); closePrompt.Position=UDim2.new(0,14,0,0); closePrompt.Visible=false; closePrompt.Parent=panel; closePrompt.ZIndex=5; corner(closePrompt)
+    local prompt=text(closePrompt,"Save progress before closing?",12,C.text,true); prompt.Position=UDim2.new(0,10,0,8); prompt.Size=UDim2.new(1,-20,0,22)
+    local saveClose=button(closePrompt,"SAVE & CLOSE",function() local ok,success=pcall(Lab.save); if not ok or not success then notice="Couldn't save. Keep this window open and try again."; status.Text=notice; closePrompt.Visible=false; return end; closePrompt.Visible=false; alive=false; pcall(Lab.stop); if Lab.close then pcall(Lab.close) end; gui:Destroy() end,C.mint,120); saveClose.Position=UDim2.new(0,10,0,48)
+    local closeAnyway=button(closePrompt,"CLOSE",function() closePrompt.Visible=false; alive=false; pcall(Lab.stop); if Lab.close then pcall(Lab.close) end; gui:Destroy() end,C.red,80); closeAnyway.Position=UDim2.new(0,140,0,48)
+    local cancel=button(closePrompt,"CANCEL",function() closePrompt.Visible=false end,C.panel,80); cancel.Position=UDim2.new(0,230,0,48)
+    close.Activated:Connect(function() closePrompt.Visible=true end)
+    local resizeHandle=Instance.new("TextButton"); resizeHandle.Name="SuiteResizeHandle"; resizeHandle.Text=""; resizeHandle.BackgroundTransparency=1; resizeHandle.Size=UDim2.fromOffset(22,22); resizeHandle.Position=UDim2.new(1,-22,1,-22); resizeHandle.Parent=root
+    local conns={}; local dragging,resizing,startInput,start
+    table.insert(conns,drag.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=true; startInput=i.Position; start={x=state.x,y=state.y} end end))
+    table.insert(conns,resizeHandle.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then resizing=true; startInput=i.Position; start={w=state.w,h=state.h} end end))
+    table.insert(conns,UIS.InputChanged:Connect(function(i) if not startInput or (i.UserInputType~=Enum.UserInputType.MouseMovement and i.UserInputType~=Enum.UserInputType.Touch) then return end; local d=i.Position-startInput; if dragging then move(start.x+d.X,start.y+d.Y) elseif resizing then resize(start.w+d.X,start.h+d.Y) end end))
+    table.insert(conns,UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=false; resizing=false; startInput=nil end end))
+    table.insert(conns,gui.Destroying:Connect(function() alive=false; for _,c in ipairs(conns) do pcall(function() c:Disconnect() end) end end))
+    local camera=workspace.CurrentCamera
+    if camera then pcall(function() table.insert(conns,camera:GetPropertyChangedSignal("ViewportSize"):Connect(function() if maximized then local v=viewport(); state.x,state.y,state.w,state.h=0,0,v.X,v.Y else clamp() end; apply() end)) end) end
+    local busy=false
+    local function refresh(v)
+        local checks=v.checks or {}; local lines={}; for i=1,5 do local c=checks[i] or {}; lines[#lines+1]=(c.state=="done" and "✓" or "○") .. "  " .. tostring(c.label or ("Step "..i)) end
+        checklist.Text=table.concat(lines,"\n"); instruction.Text=tostring(v.title or "Lane persistence") .. "\n\n" .. tostring(v.instruction or "Follow the prompt, then continue."); if not busy then action.Text=tostring(v.button or "Continue") end; action.BackgroundColor3=(v.busy or busy) and C.panel2 or C.mint; action.AutoButtonColor=not (v.busy or busy); status.Text=tostring(notice or v.message or v.status or "Ready"); filename.Text=v.filename and ("Saved file: "..tostring(v.filename)) or ""
     end
-    local function applyWindow()
-        root.Position = UDim2.fromOffset(windowState.x, windowState.y); root.Size = UDim2.fromOffset(windowState.width, minimized and 54 or windowState.height); body.Visible = not minimized; root.BackgroundTransparency = minimized and 1 or .08
-        minBtn.Text = minimized and "RESTORE" or "MINIMIZE"; maxBtn.Text = maxed and "RESTORE" or "MAXIMIZE"
-    end
-    local function moveWindow(x, y) if maxed then return end; windowState.x, windowState.y = x, y; constrain(); normal.x, normal.y = windowState.x, windowState.y end
-    local function resizeWindow(w, h) if maxed or minimized then return end; windowState.width, windowState.height = w, h; constrain(); normal.w, normal.h = windowState.width, windowState.height end
-    local function minimizeWindow() minimized = true; windowState.minimized = true; applyWindow() end
-    local function restoreWindow()
-        local wasMinimized = minimized
-        minimized = false; windowState.minimized = false
-        if maxed and not wasMinimized then maxed = false; windowState.maximized = false; windowState.x, windowState.y, windowState.width, windowState.height = normal.x, normal.y, normal.w, normal.h end
-        constrain(); applyWindow()
-    end
-    local function maximizeWindow()
-        if not maxed then
-            if not minimized then normal = {x = windowState.x, y = windowState.y, w = windowState.width, h = windowState.height} end
-            local view = viewportSize(); maxed = true; minimized = false; windowState.maximized = true; windowState.minimized = false; windowState.x, windowState.y, windowState.width, windowState.height = 0, 0, view.X, view.Y
-        else maxed = false; windowState.maximized = false; windowState.x, windowState.y, windowState.width, windowState.height = normal.x, normal.y, normal.w, normal.h end
-        constrain()
-        applyWindow()
-    end
-    Lab.windowControls = {getState = function() return {x=windowState.x,y=windowState.y,width=windowState.width,height=windowState.height,minimized=minimized,maximized=maxed} end, move=moveWindow, resize=resizeWindow, minimize=minimizeWindow, maximize=maximizeWindow, restore=restoreWindow, constrain=constrain}
-    minBtn = button(top, "MINIMIZE", function()
-        if minimized then restoreWindow() else minimizeWindow() end
-    end, C.panel2, 82); minBtn.Position = UDim2.new(1, -270, 0, 12)
-    maxBtn = button(top, "MAXIMIZE", maximizeWindow, C.panel2, 82); maxBtn.Name = "SuiteMaximizeButton"; maxBtn.Position = UDim2.new(1, -358, 0, 12)
-    minBtn.Name = "SuiteMinimizeButton"
-    local stopBtn = button(top, "STOP", function() pcall(Lab.stop); refs.status.Text = "stopped (export remains available)" end, C.panel2, 54); stopBtn.Position = UDim2.new(1, -182, 0, 12)
-    local requestClose = function() end
-    local closeBtn = button(top, "CLOSE", function() requestClose() end, C.red, 54); closeBtn.Position = UDim2.new(1, -120, 0, 12)
-
-    body = Instance.new("Frame"); body.BackgroundTransparency = 1; body.Position = UDim2.new(0, 10, 0, 62); body.Size = UDim2.new(1, -20, 1, -70); body.Parent = root
-    local dragZone = Instance.new("Frame"); dragZone.Name = "SuiteDragZone"; dragZone.BackgroundTransparency = 1; dragZone.Position = UDim2.new(0, 0, 0, 0); dragZone.Size = UDim2.new(1, -370, 0, 54); dragZone.ZIndex = 3; dragZone.Parent = top
-    local resizeHandle = Instance.new("TextButton"); resizeHandle.Name = "SuiteResizeHandle"; resizeHandle.Text = ""; resizeHandle.BackgroundTransparency = 1; resizeHandle.Size = UDim2.new(0, 22, 0, 22); resizeHandle.Position = UDim2.new(1, -22, 1, -22); resizeHandle.ZIndex = 4; resizeHandle.Parent = root
-    local dragging, resizing, dragStart, startState
-    local inputConnections = {}
-    table.insert(inputConnections, dragZone.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = true; dragStart = input.Position; startState = {x=windowState.x,y=windowState.y}; end end))
-    table.insert(inputConnections, resizeHandle.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then resizing = true; dragStart = input.Position; startState = {w=windowState.width,h=windowState.height}; end end))
-    table.insert(inputConnections, UIS.InputChanged:Connect(function(input) if not dragStart then return end; if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end; local d = input.Position - dragStart; if dragging then moveWindow(startState.x + d.X, startState.y + d.Y) elseif resizing then resizeWindow(startState.w + d.X, startState.h + d.Y) end end))
-    table.insert(inputConnections, UIS.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging, resizing, dragStart = false, false, nil end end))
-    table.insert(inputConnections, gui.Destroying:Connect(function() alive = false; for _, connection in ipairs(inputConnections) do pcall(function() connection:Disconnect() end) end end))
-    local camera = workspace.CurrentCamera
-    if camera then pcall(function() table.insert(inputConnections, camera:GetPropertyChangedSignal("ViewportSize"):Connect(function() if not maxed then constrain() else local size = viewportSize(); windowState.width, windowState.height = size.X, size.Y; applyWindow() end end)) end) end
-    local left = frame(body, C.panel, UDim2.new(.29, -5, 1, 0)); left.Position = UDim2.new(0, 0, 0, 0)
-    local right = frame(body, C.panel, UDim2.new(.71, -5, 1, 0)); right.Position = UDim2.new(.29, 10, 0, 0)
-    label(left, "TEST PLAN", 13, C.mint, true).Position = UDim2.new(0, 12, 0, 10)
-    local listScroll = Instance.new("ScrollingFrame"); listScroll.BackgroundTransparency = 1; listScroll.BorderSizePixel = 0; listScroll.Position = UDim2.new(0, 8, 0, 37); listScroll.Size = UDim2.new(1, -16, 1, -45); listScroll.ScrollBarThickness = 4; listScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; listScroll.CanvasSize = UDim2.new(); listScroll.Parent = left
-    list(listScroll, 5)
-    local detailScroll = Instance.new("ScrollingFrame"); detailScroll.BackgroundTransparency = 1; detailScroll.BorderSizePixel = 0; detailScroll.Position = UDim2.new(0, 10, 0, 8); detailScroll.Size = UDim2.new(1, -20, 1, -16); detailScroll.ScrollBarThickness = 5; detailScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; detailScroll.CanvasSize = UDim2.new(); detailScroll.Parent = right
-    list(detailScroll, 8)
-    local detail = detailScroll
-    local function wipeDetail() for _, c in ipairs(detail:GetChildren()) do if not c:IsA("UIListLayout") then c:Destroy() end end end
-
-    local modal = frame(gui, C.panel, UDim2.new(0, 350, 0, 190)); modal.AnchorPoint = Vector2.new(.5, .5); modal.Position = UDim2.new(.5, 0, .5, 0); modal.Visible = false; modal.ZIndex = 30; stroke(modal, C.amber)
-    local modalText = label(modal, "", 13, C.text, false); modalText.Position = UDim2.new(0, 16, 0, 16); modalText.Size = UDim2.new(1, -32, 0, 82); modalText.ZIndex = 31
-    local modalCancel = button(modal, "CANCEL", function() modal.Visible = false end, C.panel2, 100); modalCancel.Position = UDim2.new(0, 28, 1, -48); modalCancel.ZIndex = 31
-    local pendingCallback
-    local modalGo = button(modal, "CONFIRM", function() modal.Visible = false; local callback = pendingCallback; pendingCallback = nil; if callback then callback() end end, C.mintDark, 110); modalGo.Position = UDim2.new(1, -138, 1, -48); modalGo.ZIndex = 31
-    local function confirm(text, callback) modalText.Text = text; pendingCallback = callback; modal.Visible = true end
-    requestClose = function()
-        confirm("Close the suite? Export first if you need the evidence file. This will stop subscriptions and remove the window.", function()
-            pcall(Lab.stop); alive = false; pcall(Lab.close); if gui.Parent then gui:Destroy() end
-        end)
-    end
-
-    local actionBox = frame(detail, C.panel2, UDim2.new(1, 0, 0, 0)); actionBox.AutomaticSize = Enum.AutomaticSize.Y; actionBox.LayoutOrder = 40
-    label(actionBox, "ACTION CONSOLE", 13, C.mint, true).Position = UDim2.new(0, 12, 0, 10)
-    local actionHint = label(actionBox, "Read-only probes can run from Survey. Mutations require an active trial and confirmation.", 11, C.muted, false); actionHint.Position = UDim2.new(0, 12, 0, 31); actionHint.Size = UDim2.new(1, -24, 0, 28)
-    local actionList = Instance.new("Frame"); actionList.BackgroundTransparency = 1; actionList.Position = UDim2.new(0, 12, 0, 64); actionList.Size = UDim2.new(1, -24, 0, 0); actionList.AutomaticSize = Enum.AutomaticSize.Y; actionList.Parent = actionBox; list(actionList, 5)
-    local trialBox, stateBox, markerBox, reviewBox
-    local function parseValue(typ, text)
-        if typ == "number" then return tonumber(text) end
-        if typ == "list" then local out = {}; for x in string.gmatch(text or "", "[^,]+") do table.insert(out, (string.gsub(x, "^%s*(.-)%s*$", "%1"))) end; return out end
-        return text
-    end
-    local function renderActions()
-        for _, c in ipairs(actionList:GetChildren()) do if not c:IsA("UIListLayout") then c:Destroy() end end
-        actionInputs = {}
-        local t = testById(selectedId)
-        local wanted = {}
-        for _, id in ipairs((t and t.actions) or {}) do wanted[tostring(id)] = true end
-        local actions = {}
-        for _, candidate in ipairs(Lab.actions or {}) do
-            if wanted[tostring(candidate.id)] then table.insert(actions, candidate) end
-        end
-        for _, a in ipairs(actions) do
-            local row = Instance.new("Frame"); row.BackgroundTransparency = 1; row.Size = UDim2.new(1, 0, 0, (#(a.fields or {}) * 34) + 34); row.Parent = actionList
-            local run = button(row, a.label or a.id, nil, a.risk == "read" and C.mintDark or C.panel, 190); run.Position = UDim2.new(0, 0, 0, 1)
-            local inputs = {}; actionInputs[a.id] = inputs
-            for i, f in ipairs(a.fields or {}) do local t = field(row, f.label or f.key, tostring(f.default or "")); t.Position = UDim2.new(0, 198, 0, 1 + (i - 1) * 34); t.Size = UDim2.new(1, -198, 0, 29); inputs[f.key] = {box=t, spec=f} end
-            run.Activated:Connect(function()
-                local args = {}; for key, item in pairs(inputs) do args[key] = parseValue(item.spec.type, item.box.Text) end
-                local read = a.risk == "read"; local v = safeView()
-                if not read and not v.activeTrial then refs.status.Text = "Start a trial before a mutation action"; return end
-                local invoke = function()
-                    pcall(Lab.setNotes, notes and notes.Text or "")
-                    local ok, success, msg = pcall(function() return Lab.command(a.id, args) end)
-                    local now = safeView()
-                    refs.status.Text = ok and (tostring(msg or now.message or (success and "action sent" or "action rejected"))) or "action failed: " .. tostring(success)
-                end
-                if read then invoke() else confirm("This action is marked " .. tostring(a.risk) .. ". It may change live state. Continue only if the prerequisites and budget are correct.", invoke) end
-            end)
-        end
-    end
-    -- Render once the selected test is known below; this avoids putting every mutation action in every test.
-
-    local selected = label(detail, "Select a test from the plan", 18, C.text, true); selected.Size = UDim2.new(1, 0, 0, 28)
-    local desc = label(detail, "", 12, C.muted, false); desc.Size = UDim2.new(1, 0, 0, 0)
-    local info = frame(detail, C.panel2, UDim2.new(1, 0, 0, 0)); info.AutomaticSize = Enum.AutomaticSize.Y; list(info, 4)
-    local function infoLine(caption, value) local l = label(info, caption .. "\n" .. (value or "—"), 11, C.text, false); l.Size = UDim2.new(1, -20, 0, 0); l.Position = UDim2.new(0, 10, 0, 0); return l end
-    local goalLine, prereqLine, stepsLine, evidenceLine, limitsLine
-    local function renderSelected()
-        local t = testById(selectedId); if not t then selected.Text = "Select a test from the plan"; desc.Text = ""; return end
-        selected.Text = tostring(t.title or t.name or t.id); desc.Text = tostring(t.goal or t.description or "")
-        goalLine.Text = "GOAL\n" .. tostring(t.goal or t.description or "—"); prereqLine.Text = "PREREQUISITES\n" .. arr(t.prerequisites or t.prereqs or {}); stepsLine.Text = "STEPS\n" .. arr(t.steps or {}); evidenceLine.Text = "EXPECTED EVIDENCE\n" .. arr(t.evidence or t.expectedEvidence or {}); limitsLine.Text = "LIMITS\n" .. arr(t.limits or {})
-        renderActions()
-    end
-    goalLine = infoLine("GOAL", ""); prereqLine = infoLine("PREREQUISITES", ""); stepsLine = infoLine("STEPS", ""); evidenceLine = infoLine("EXPECTED EVIDENCE", ""); limitsLine = infoLine("LIMITS", "")
-
-    trialBox = frame(detail, C.panel2, UDim2.new(1, 0, 0, 0)); trialBox.AutomaticSize = Enum.AutomaticSize.Y; trialBox.LayoutOrder = 20; list(trialBox, 6)
-    local trialTitle = label(trialBox, "TRIAL", 13, C.mint, true); trialTitle.Size = UDim2.new(1, -20, 0, 20); trialTitle.Position = UDim2.new(0, 10, 0, 8)
-    local initialViewForFields = safeView()
-    experiment = field(trialBox, "Experiment label (e.g. mxssyo-world9-shop)", tostring(initialViewForFields.experiment or "")); experiment.Position = UDim2.new(0, 10, 0, 34); experiment.Size = UDim2.new(1, -20, 0, 30)
-    notes = field(trialBox, "Operator notes; do not include secrets", tostring(initialViewForFields.notes or "")); notes.Position = UDim2.new(0, 10, 0, 68); notes.Size = UDim2.new(1, -20, 0, 30)
-    local preserve = button(trialBox, "", function()
-        local current = safeView().preserveLanes == true; local desired = not current
-        local ok, success, msg = pcall(function() return Lab.setPreserve(desired) end)
-        refs.status.Text = ok and tostring(msg or (success and (desired and "lane protection enabled" or "lane protection disabled") or "lane protection rejected")) or tostring(success)
-    end, C.panel, 0); preserve.Position = UDim2.new(0, 10, 0, 102); preserve.Size = UDim2.new(1, -20, 0, 28); preserve.TextXAlignment = Enum.TextXAlignment.Left
-    local trialBtns = Instance.new("Frame"); trialBtns.BackgroundTransparency = 1; trialBtns.Size = UDim2.new(1, -20, 0, 34); trialBtns.Position = UDim2.new(0, 10, 0, 136); trialBtns.Parent = trialBox
-    local start = button(trialBtns, "START TRIAL", function() if not selectedId then refs.status.Text = "Select a test first"; return end; pcall(Lab.setExperiment, experiment.Text); pcall(Lab.setNotes, notes.Text); pcall(Lab.startTrial); refs.status.Text = "trial started" end, C.mintDark, 112)
-    local survey = button(trialBtns, "SURVEY", function() local ok, msg = pcall(Lab.survey); refs.status.Text = ok and tostring(msg or "survey complete") or tostring(msg) end, C.panel, 76); survey.Position = UDim2.new(0, 120, 0, 0)
-    markerBox = frame(detail, C.panel2, UDim2.new(1, 0, 0, 0)); markerBox.AutomaticSize = Enum.AutomaticSize.Y; markerBox.LayoutOrder = 30; list(markerBox, 6)
-    label(markerBox, "EVIDENCE MARKERS", 13, C.mint, true).Position = UDim2.new(0, 10, 0, 8)
-    local markerBtns = Instance.new("Frame"); markerBtns.BackgroundTransparency = 1; markerBtns.Size = UDim2.new(1, -20, 0, 34); markerBtns.Position = UDim2.new(0, 10, 0, 30); markerBtns.Parent = markerBox
-    local function mark(phase) return function() local v = safeView(); if not v.activeTrial then refs.status.Text = "Start a trial first"; return end; pcall(Lab.setNotes, notes.Text); local ok, msg = pcall(Lab.mark, phase); refs.status.Text = ok and tostring(msg or (phase .. " recorded")) or tostring(msg) end end
-    button(markerBtns, "BASELINE", mark("before"), C.panel, 88); local ab = button(markerBtns, "ACTION", mark("action"), C.panel, 78); ab.Position = UDim2.new(0, 94, 0, 0); local af = button(markerBtns, "AFTER", mark("after"), C.panel, 74); af.Position = UDim2.new(0, 178, 0, 0); local no = button(markerBtns, "NOTE", mark("note"), C.panel, 66); no.Position = UDim2.new(0, 258, 0, 0)
-    local review = Instance.new("Frame"); review.BackgroundTransparency = 1; review.Size = UDim2.new(1, -20, 0, 72); review.Position = UDim2.new(0, 10, 0, 70); review.Parent = markerBox
-    local reviewLabel = label(review, "Operator review (does not certify game state):", 11, C.muted, false); reviewLabel.Position = UDim2.new(0, 0, 0, 0); reviewLabel.Size = UDim2.new(1, 0, 0, 24)
-    local reviewButtons = Instance.new("Frame"); reviewButtons.BackgroundTransparency = 1; reviewButtons.Position = UDim2.new(0, 0, 0, 28); reviewButtons.Size = UDim2.new(1, 0, 0, 40); reviewButtons.Parent = review
-    local reviewGrid = Instance.new("UIGridLayout"); reviewGrid.CellSize = UDim2.new(0, 84, 0, 30); reviewGrid.CellPadding = UDim2.new(0, 5, 0, 5); reviewGrid.Parent = reviewButtons
-    local statuses = {"OBSERVED", "PASS", "FAIL", "BLOCKED", "NOT_RUN"}
-    for _, st in ipairs(statuses) do button(reviewButtons, st, function() if not selectedId then return end; pcall(Lab.setNotes, notes.Text); local ok, success, msg = pcall(function() return Lab.review(st) end); local now = safeView(); refs.status.Text = ok and tostring(msg or now.message or (success and ("review " .. st) or "review rejected")) or tostring(success) end, st == "PASS" and C.mintDark or (st == "FAIL" and C.red or C.panel), 78) end
-
-    stateBox = frame(detail, C.panel2, UDim2.new(1, 0, 0, 0)); stateBox.AutomaticSize = Enum.AutomaticSize.Y; stateBox.LayoutOrder = 50; list(stateBox, 4)
-    local stateTitle = label(stateBox, "LIVE VIEW", 13, C.mint, true); stateTitle.Position = UDim2.new(0, 10, 0, 8)
-    refs.status = label(stateBox, "connecting…", 11, C.muted, false); refs.status.Position = UDim2.new(0, 10, 0, 30); refs.status.Size = UDim2.new(1, -20, 0, 18)
-    refs.progress = label(stateBox, "cases: —", 11, C.muted, false); refs.progress.Position = UDim2.new(0, 10, 0, 49); refs.progress.Size = UDim2.new(1, -20, 0, 18)
-    refs.live = label(stateBox, "", 11, C.text, false); refs.live.Position = UDim2.new(0, 10, 0, 51); refs.live.Size = UDim2.new(1, -20, 0, 0)
-    local exportBox = frame(detail, C.panel2, UDim2.new(1, 0, 0, 0)); exportBox.AutomaticSize = Enum.AutomaticSize.Y; exportBox.LayoutOrder = 60; list(exportBox, 6)
-    label(exportBox, "EXPORT", 13, C.mint, true).Position = UDim2.new(0, 10, 0, 8)
-    local exportBtns = Instance.new("Frame"); exportBtns.BackgroundTransparency = 1; exportBtns.Size = UDim2.new(1, -20, 0, 34); exportBtns.Position = UDim2.new(0, 10, 0, 30); exportBtns.Parent = exportBox
-    local exportText = field(exportBox, "Selectable JSON fallback appears here after Copy"); exportText.Position = UDim2.new(0, 10, 0, 70); exportText.Size = UDim2.new(1, -20, 0, 70); exportText.MultiLine = true; exportText.TextWrapped = false; exportText.TextYAlignment = Enum.TextYAlignment.Top
-    button(exportBtns, "SAVE", function() local ok, msg = pcall(Lab.save); refs.status.Text = ok and tostring(msg or "saved") or tostring(msg) end, C.mintDark, 76)
-    local copy = button(exportBtns, "COPY", function() local ok, success, msg = pcall(Lab.copy); local rawOK, raw = pcall(Lab.exportJSON); if rawOK then exportText.Text = tostring(raw) end; refs.status.Text = ok and tostring(msg or safeView().message or (success and "copied" or "use JSON below")) or "clipboard unavailable; JSON below" end, C.panel, 76); copy.Position = UDim2.new(0, 82, 0, 0)
-    local replay = button(exportBtns, "REPLAY (ISOLATED)", function() local ok, msg = pcall(Lab.replay); refs.status.Text = ok and tostring(msg or "synthetic replay complete") or tostring(msg) end, C.panel, 142); replay.Position = UDim2.new(0, 164, 0, 0)
-
-    local initialCaseView = safeView()
-    for _, t in ipairs(Lab.tests or {}) do
-        local id = tostring(t.id); local b = button(listScroll, statusMark(caseStatus(initialCaseView, id)) .. "  " .. tostring(t.group or "NOW") .. "  /  " .. tostring(t.title or t.name or id), function() selectedId = id; pcall(Lab.selectTest, id); renderSelected(); refs.status.Text = "selected " .. id end, C.panel2, 0); b.Size = UDim2.new(1, 0, 0, 38); b.TextXAlignment = Enum.TextXAlignment.Left; b.TextWrapped = true; caseButtons[id] = b
-    end
-    local initialView = safeView(); selectedId = initialView.selectedTestId or (Lab.tests and Lab.tests[1] and tostring(Lab.tests[1].id)); if selectedId then pcall(Lab.selectTest, selectedId) end; renderSelected()
-    local function count(v)
-        if type(v) ~= "table" then return 0 end
-        local n = 0; for _ in pairs(v) do n = n + 1 end; return n
-    end
-    local function resultText(v)
-        local r = (v.results or {})[selectedId or ""]
-        if type(r) ~= "table" then return "NOT_RUN" end
-        return tostring(r.status or "NOT_RUN") .. (r.captured and (r.saved and " / evidence SAVED" or " / evidence not saved") or " / After needed") .. (r.notes and r.notes ~= "" and (" / " .. tostring(r.notes)) or "")
-    end
-    task.spawn(function()
-        while alive and gui.Parent do
-            task.wait(1)
-            local v = safeView(); if not alive or not gui.Parent then break end
-            title.Text = "SLASH  /  EVIDENCE SUITE  v" .. tostring(v.version or "1")
-            local s = v.summary or {}; local snap = v.snapshot or {}; local shop = snap.shop; local drops = snap.drops or snap.currentDrops; local pos = snap.position
-            local posText = type(pos) == "table" and (tostring(pos.X or pos.x or "?") .. "," .. tostring(pos.Z or pos.z or "?")) or tostring(pos or "—")
-            local shopOffers = type(shop) == "table" and (shop.Offers or shop.offers) or nil
-            local offerNames = {}; for _, offer in pairs(type(shopOffers) == "table" and shopOffers or {}) do offerNames[#offerNames + 1] = tostring(offer) end
-            local shopText = type(shop) == "table" and (tostring(count(shopOffers)) .. " offer(s): " .. table.concat(offerNames, ", ")) or tostring(shop and "available" or "—")
-            local dropText = type(drops) == "table" and tostring(count(drops)) .. " current" or tostring(drops and "visible" or "—")
-            local active = v.activeTrial and (tostring(v.activeTrial.phase or "active") .. " / " .. tostring(v.activeTrial.id or "")) or "none"
-            local err = s.saveError and (" saveError=" .. tostring(s.saveError)) or ""
-            local clock = snap.dropState or {}; local signals = snap.swordSignals or {}; local lastSignal
-            for _, signal in pairs(signals) do if signal.kind == "Impact" then lastSignal = signal end end
-            local dropInfo = "Sword state: world " .. tostring(clock.World or "?") .. " / " .. tostring(clock.SwordName or "?") .. " / " .. tostring(clock.Phase or "?")
-            if lastSignal and type(lastSignal.position) == "table" then local p = lastSignal.position; dropInfo = dropInfo .. "\nLast impact: " .. tostring(p.x) .. ", " .. tostring(p.y) .. ", " .. tostring(p.z) .. " (world hint " .. tostring(lastSignal.singletonWorldHint or "?") .. ")" end
-            local delta = v.lastDelta; local deltaText = ""
-            if delta then local d = {}; for name, value in pairs(delta.stats or {}) do d[#d + 1] = tostring(name) .. " " .. tostring(value) end; deltaText = "\nLast observed deltas: " .. table.concat(d, ", ") .. "; pets +" .. tostring(#(delta.petsAdded or {})) .. " / -" .. tostring(#(delta.petsRemoved or {})) end
-            refs.live.Text = statLine(v) .. "\nposition: " .. posText .. "  •  shop: " .. shopText .. "  •  drops: " .. dropText .. "  •  players: " .. tostring(#(v.players or {})) .. "\n" .. dropInfo .. "\ntrial: " .. active .. "  •  selected result: " .. resultText(v) .. "\nevents " .. tostring(s.events or 0) .. "  records " .. tostring(s.records or 0) .. "  dropped " .. tostring(s.dropped or 0) .. "  truncations " .. tostring(s.truncations or 0) .. "  saved parts " .. tostring(s.segments or 0) .. err .. deltaText .. "\nmessage: " .. tostring(v.message or "ready")
-            preserve.Text = "Preserve lanes: " .. (v.preserveLanes and "ON (suite guard; manual touches remain possible)" or "OFF")
-            local cases = s.caseCounts or {}; refs.progress.Text = "cases saved " .. tostring(cases.saved or 0) .. "/" .. tostring(cases.total or #caseButtons) .. "  •  captured " .. tostring(cases.observed or 0) .. "  •  Saved = durable evidence; PASS = reviewed outcome"
-            for id, b in pairs(caseButtons) do local t = testById(id); if t then b.Text = statusMark(caseStatus(v, id)) .. "  " .. tostring(t.group or "NOW") .. "  /  " .. tostring(t.title or t.name or id) end end
-            if v.message and v.message ~= "" then refs.status.Text = tostring(v.message) end
-        end
-    end)
-    return gui
+    action.Activated:Connect(function() if busy then return end; notice=nil; busy=true; action.Text="Working…"; task.spawn(function() local ok,success,msg=pcall(Lab.laneAction); busy=false; if not ok then notice="This step couldn't finish. Save progress and keep the window open." else status.Text=tostring(msg or (success and "Done." or "Action did not complete.")) end; refresh(view()) end) end)
+    task.spawn(function() while alive and gui.Parent do task.wait(1); if alive then refresh(view()) end end end)
+    refresh(view())
 end
 
 buildUI(Lab)

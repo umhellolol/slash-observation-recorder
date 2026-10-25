@@ -1,5 +1,19 @@
 # Slash in-game evidence suite coverage
 
+## Version 1.2 focused screen
+
+The user-facing UI now contains only the guided lane-persistence experiment. The 22-case catalog below remains exported evidence metadata and an engineering coverage map; it is not a request to repeat all those cases. Manual review/action controls from versions 1.0–1.1 are no longer shown. Existing engine APIs remain for regression checks and future development.
+
+The guide starts a T01 trial, disables Auto Win/AutoRebirth, requires a living character outside training and two unlocked worlds, reads fresh PersonalWallsInit data, and verifies all stages in the current world's client configuration are cleared. It records a new baseline, travels to another unlocked world and back, and requires another fresh lane response. A scoped PASS requires the same JobId, unchanged invalidation generation, confirmed destination/return, automation still off, and all prepared stages still cleared. FAIL means fresh returned data lost prepared stages. Claims, local rebirths, respawns, new personal wall breaks/clears, failed travel and missing responses cannot silently become PASS. Freshness means a response observed in a request window; the protocol has no request correlation ID.
+
+Repeated baseline markers now replace the delta baseline. Historical unfinished trials remain INCOMPLETE. Command status/reason, observed evidence, the guided mechanic result and saving status are separate fields. Travel, respawn, local rebirth and reward claims invalidate cached wall freshness. Complete JSON includes `guidedLane`, detailed departure/return snapshots and the raw event stream.
+
+The 25 October capture review established remote shop reads, distance-gated purchases, three quantity-confirmed sword pickups, travel, AFK/settings, pets, Lucky Blocks and local rebirth activity. It is documented locally in Slash Test Capture Review.md. The user need not reproduce those observations. Future shop policy targets only `PrismaticCosmos` (Rainbow, configured at 3,000 Crystals), highest regular-gameplay priority across instances including Main, separate from Admin Abuse. No shop automation is implemented by this guided test.
+
+Version 1.2 validation uses the actual assembled Lua with a simulated Roblox API: core engine with/without file storage, baseline/status regressions, drag/resize/restore, guided success/reset, claim/respawn interruptions, fresh-response timeouts before and after travel, partial travel failure, save failure and actual UI button dispatch. This does not claim an actual Roblox renderer or live lane result.
+
+## Retained contract coverage
+
 This suite is an evidence collector for one local account. The intended main test account is **mxssyo**; the suite resolves its numeric UserId at runtime and does not require a second agent. A willing player may be used later for a manual trade, but that player does not need to run the suite.
 
 The suite is not the desktop platform and does not recover hidden server code. Every result is an operator review (`OBSERVED`, `PASS`, `FAIL`, `BLOCKED`, or `NOT_RUN`). A notification, request, UI change, or disappearing object is not authoritative success by itself. Live observations, source replay, and event-contract replay stay separate.

@@ -62,4 +62,4 @@ Syntax checks, a no-gameplay-server-call check, and simulated Lua lifecycle chec
 
 ## Comprehensive in-game test suite
 
-The recorder has been expanded into a single-account testing suite for mxssyo, with 22 guided cases, controlled probes, local evidence segments and isolated event-contract replay. This is still pre-platform information gathering. See [TEST-SUITE.md](TEST-SUITE.md) for the loadstring and run guide, and [TEST-COVERAGE.md](TEST-COVERAGE.md) for the requirement mapping. The original recorder.lua remains available.
+The recorder has been expanded into a single-account testing suite for mxssyo, with a simple guided lane-persistence check, local evidence segments and a retained 22-case engineering catalog. Version 1.2 shows only the steps needed for the remaining lane test. This is still pre-platform information gathering. See [TEST-SUITE.md](TEST-SUITE.md) for the loadstring and run guide, and [TEST-COVERAGE.md](TEST-COVERAGE.md) for the requirement mapping. The original recorder.lua remains available.
