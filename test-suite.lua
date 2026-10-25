@@ -1,4 +1,4 @@
--- Slash In-Game Test Suite 1.0.0. Source only; captured data is never uploaded.
+-- Slash In-Game Test Suite 1.1.0. Source only; captured data is never uploaded.
 -- mxssyo is the preferred test account. No second instrumented client is required.
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -9,10 +9,20 @@ assert(RunService:IsClient(), "Run this suite in a Roblox client.")
 assert(game.PlaceId == 101558013317432 or RunService:IsStudio(), "This suite is for Slash place 101558013317432.")
 local player = assert(Players.LocalPlayer, "Join the game before starting the suite.")
 local playerGui = assert(player:WaitForChild("PlayerGui", 10), "PlayerGui is not ready; retry after loading.")
-if playerGui:FindFirstChild("SlashInGameTestSuite") then warn("Suite already loaded. Export, stop and close it before reloading."); return end
+local uiHosts = { playerGui }
+if type(gethui) == "function" then
+    local ok, host = pcall(gethui)
+    if ok and typeof(host) == "Instance" then uiHosts[#uiHosts + 1] = host end
+end
+local coreOK, core = pcall(function() return game:GetService("CoreGui") end)
+if coreOK then uiHosts[#uiHosts + 1] = core end
+for _, host in ipairs(uiHosts) do
+    local ok, existing = pcall(function() return host:FindFirstChild("SlashInGameTestSuite", true) end)
+    if ok and existing then warn("Suite already loaded. Export, stop and close it before reloading."); return end
+end
 if playerGui:FindFirstChild("SlashObservationRecorder") then warn("Older recorder is still present. Stop it to avoid duplicate recordings; this suite has its own recorder.") end
 
-local Lab = { version = "1.0.0", running = true, expectedMain = "mxssyo", selectedTestId = nil,
+local Lab = { version = "1.1.0", running = true, expectedMain = "mxssyo", selectedTestId = nil,
     experiment = "mxssyo-001", notes = "", preserveLanes = true, trials = {}, results = {}, simulation = {},
     message = "Ready. Start with Survey, then choose a test. No gameplay mutations run automatically." }
 local writer = type(writefile) == "function" and writefile or nil
@@ -35,6 +45,26 @@ local swordSignals = {}
 local probes, ambientCounts, ambientSamples, prepared = {}, {}, {}, nil
 local scanDrops, scanAnchors, instanceIds, nextInstanceId = {}, {}, setmetatable({}, { __mode = "k" }), 0
 local record, snapshot, persist
+local requestsSent = 0
+local function checklistResult(trial)
+    local result = Lab.results[trial.testId]
+    if not result or result.trialId ~= trial.id then
+        result = { status = "RUNNING", trialId = trial.id, captured = false, saved = false, notes = "", scope = trial.evidenceScope }
+        Lab.results[trial.testId] = result
+    end
+    return result
+end
+local function refreshSavedChecklist()
+    for _, trial in ipairs(Lab.trials) do
+        if trial.afterSeq and trial.afterSeq <= savedSeq then
+            trial.evidenceSaved = true; trial.savedThroughSeq = savedSeq
+            local result = Lab.results[trial.testId]
+            if result and result.trialId == trial.id then
+                result.saved = true; result.captured = true; result.saveVerified = reader ~= nil
+            end
+        end
+    end
+end
 local Model = {}
 function Model.dropEligibility(drop, userId, clock)
     if type(drop) ~= "table" then return "UNKNOWN" end
@@ -219,6 +249,7 @@ persist = function(force)
     if not ok then saveError = tostring(err); return false, saveError end
     segments[#segments + 1] = { filename = filename, firstSeq = pending[1].seq, lastSeq = pending[#pending].seq, bytes = #json, readBackVerified = reader ~= nil }
     savedSeq = pending[#pending].seq; lastSave = os.clock(); saveError = nil
+    refreshSavedChecklist()
     return true
 end
 local function capture(kind, extra)
@@ -403,6 +434,7 @@ local function send(remoteNames, action, ...)
     assert(remote and remote:IsA("RemoteEvent"), "Required binding missing: " .. table.concat(remoteNames, "."))
     local args = table.pack(...)
     record("outgoing-request", { action = action, path = remote:GetFullName(), args = args, position = rootPosition(), world = world() })
+    requestsSent = requestsSent + 1
     remote:FireServer(table.unpack(args, 1, args.n))
 end
 local function normal(remote, action, ...) return send({ "PunchEscapeRemotes", remote }, action, ...) end
@@ -471,6 +503,11 @@ function Lab.command(id, args)
     end
     if trade.active and action.risk ~= "read" and id ~= "trade_cancel" then return notify("Trade is open. Inventory, movement and reset actions are held until it closes.") end
     busy = true
+    local requestsBefore = requestsSent
+    if activeTrial and action.risk ~= "read" then
+        activeTrial.afterSeq = nil; activeTrial.evidenceSaved = false
+        local result = checklistResult(activeTrial); result.captured = false; result.saved = false; result.status = "RUNNING"
+    end
     local ok, err = pcall(function()
         if action.risk ~= "read" then capture("command-before", { action = id, args = args }) end
         if id == "shop_get" then probe(id, function() normal("CharmShopRequest", id, "Get") end)
@@ -569,7 +606,20 @@ function Lab.command(id, args)
         task.delay(2, function() if Lab.running then capture("command-followup", { action = id }) end end)
     end)
     busy = false
-    if not ok then record("command-blocked-or-uncertain", { action = id, reason = tostring(err) }); return notify(err) end
+    if not ok then
+        local status = requestsSent > requestsBefore and "ERROR" or "BLOCKED"
+        record("command-blocked-or-uncertain", { action = id, reason = tostring(err), checklistStatus = status })
+        if activeTrial then
+            activeTrial.lastIssue = { status = status, reason = tostring(err), action = id }
+            local result = checklistResult(activeTrial); result.status = status; result.notes = tostring(err)
+        end
+        return notify(err)
+    end
+    if activeTrial then
+        activeTrial.lastIssue = nil
+        local result = checklistResult(activeTrial)
+        if result.status == "BLOCKED" or result.status == "ERROR" then result.status = "RUNNING"; result.notes = "" end
+    end
     Lab.message = action.label .. ": request recorded. Check responses and resulting state; no automatic PASS."
     return true, Lab.message
 end
@@ -596,6 +646,7 @@ function Lab.startTrial()
     activeTrial = { id = Http:GenerateGUID(false), testId = Lab.selectedTestId, experiment = Lab.experiment, startedAt = now(), status = "RUNNING", notes = Lab.notes, markers = {},
         evidenceScope = group == "Source replay" and "Source/synthetic case; not live event certification" or "This account/session's observation case" }
     Lab.trials[#Lab.trials + 1] = activeTrial
+    checklistResult(activeTrial)
     local r = capture("before", { trialStart = true }); activeTrial.beforeSeq = r and r.seq; activeTrial.baseline = cache
     Lab.message = "Trial started; baseline captured. Follow the selected test's steps."
     return true
@@ -605,6 +656,10 @@ function Lab.mark(phase)
     if not activeTrial then return notify("Start a trial first.") end
     if phase ~= "before" and phase ~= "action" and phase ~= "after" and phase ~= "note" then return notify("Unknown marker phase.") end
     activeTrial.phase = phase
+    if phase == "action" or phase == "before" then
+        activeTrial.lastIssue = nil; activeTrial.afterSeq = nil; activeTrial.evidenceSaved = false
+        local result = checklistResult(activeTrial); result.status = "RUNNING"; result.notes = ""; result.saved = false; result.captured = false
+    end
     local r = capture(phase, { label = Lab.experiment })
     if r then
         activeTrial.markers[#activeTrial.markers + 1] = { phase = phase, seq = r.seq, notes = Lab.notes }
@@ -623,6 +678,10 @@ function Lab.mark(phase)
                 for key in pairs(previous.pets) do if not cache.pets[key] then delta.petsRemoved[#delta.petsRemoved + 1] = key end end
             end
             activeTrial.observedDelta = delta; Lab.lastDelta = delta; record("trial-observed-delta", delta)
+            activeTrial.status = activeTrial.lastIssue and activeTrial.lastIssue.status or "OBSERVED"
+            local result = checklistResult(activeTrial)
+            result.status = activeTrial.status; result.captured = true; result.saved = false
+            result.notes = activeTrial.lastIssue and activeTrial.lastIssue.reason or Lab.notes
         end
     end
     Lab.message = phase .. " captured."
@@ -633,7 +692,8 @@ function Lab.review(status)
     if not valid[status] then return notify("Unknown review status.") end
     if status == "PASS" and not activeTrial.afterSeq then return notify("Capture an After state before marking this reviewed case PASS.") end
     activeTrial.status = status; activeTrial.reviewNotes = Lab.notes; activeTrial.reviewedAt = now()
-    Lab.results[activeTrial.testId] = { status = status, notes = Lab.notes, trialId = activeTrial.id, scope = activeTrial.evidenceScope }
+    local result = checklistResult(activeTrial)
+    result.status = status; result.notes = Lab.notes; result.captured = activeTrial.afterSeq ~= nil
     record("review", { status = status, notes = Lab.notes, scope = "Operator review, not universal or automatic certification." })
     Lab.message = "Recorded operator review: " .. status
 end
@@ -685,14 +745,27 @@ function Lab.replay()
     Lab.simulation = out
     record("synthetic-replay", { results = out, fixture = fixture, scope = "Local fixture logic only; never a live event or server acceptance test." })
     Lab.message = tostring(#out) .. " isolated event-contract checks recorded separately from live tests. These do not establish server behavior."
+    if activeTrial and activeTrial.evidenceScope == "Source/synthetic case; not live event certification" then Lab.mark("after") end
     return out
 end
 function Lab.view()
     local players = {}
     for _, p in ipairs(Players:GetPlayers()) do players[#players + 1] = { username = p.Name, userId = p.UserId } end
+    local caseCounts = { total = #(Lab.tests or {}), notRun = 0, running = 0, observed = 0, saved = 0, passed = 0, blocked = 0, errors = 0, failed = 0 }
+    for _, test in ipairs(Lab.tests or {}) do
+        local result = Lab.results[test.id]
+        if not result or result.status == "NOT_RUN" then caseCounts.notRun = caseCounts.notRun + 1
+        elseif result.status == "RUNNING" then caseCounts.running = caseCounts.running + 1
+        elseif result.status == "PASS" then caseCounts.passed = caseCounts.passed + 1
+        elseif result.status == "FAIL" then caseCounts.failed = caseCounts.failed + 1
+        elseif result.status == "BLOCKED" then caseCounts.blocked = caseCounts.blocked + 1
+        elseif result.status == "ERROR" then caseCounts.errors = caseCounts.errors + 1
+        elseif result.status == "OBSERVED" then caseCounts.observed = caseCounts.observed + 1 end
+        if result and result.saved and result.captured then caseCounts.saved = caseCounts.saved + 1 end
+    end
     return { version = Lab.version, running = Lab.running, expectedMain = Lab.expectedMain, identity = { username = player.Name, userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, placeVersion = game.PlaceVersion },
         selectedTestId = Lab.selectedTestId, experiment = Lab.experiment, notes = Lab.notes, preserveLanes = Lab.preserveLanes, activeTrial = activeTrial,
-        summary = { events = incoming, records = #rows, dropped = lost, evicted = evicted, truncations = truncations, segments = #segments, saveError = saveError, filteredAmbient = filtered },
+        summary = { events = incoming, records = #rows, dropped = lost, evicted = evicted, truncations = truncations, segments = #segments, saveError = saveError, filteredAmbient = filtered, caseCounts = caseCounts },
         snapshot = cache, results = Lab.results, players = players, message = Lab.message, simulation = Lab.simulation, probes = probes, lastDelta = Lab.lastDelta }
 end
 function Lab.exportJSON()
@@ -989,6 +1062,7 @@ Lab.selectTest("T10")
 -- This part is intentionally service-agnostic: engine.lua owns Lab and catalog.lua owns Lab.tests.
 local function buildUI(Lab)
     local Players = game:GetService("Players")
+    local UIS = game:GetService("UserInputService")
     local RunService = game:GetService("RunService")
     local player = Players.LocalPlayer
     local gui = Instance.new("ScreenGui")
@@ -996,8 +1070,17 @@ local function buildUI(Lab)
     gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = true
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.DisplayOrder = 10000
-    gui.Parent = player and player:WaitForChild("PlayerGui") or game:GetService("CoreGui")
+    gui.DisplayOrder = 2147483647
+    local host
+    local candidates = {}
+    pcall(function() if type(gethui) == "function" then table.insert(candidates, gethui()) end end)
+    pcall(function() table.insert(candidates, game:GetService("CoreGui")) end)
+    if player then pcall(function() table.insert(candidates, player:WaitForChild("PlayerGui")) end) end
+    for _, candidate in ipairs(candidates) do
+        local ok = pcall(function() gui.Parent = candidate end)
+        if ok and gui.Parent == candidate then host = candidate; break end
+    end
+    if not host then error("Slash UI could not find a parent host") end
     Lab.gui = gui
 
     local C = {
@@ -1008,8 +1091,8 @@ local function buildUI(Lab)
     }
     local fonts = Enum.Font.Gotham
     local compact = Enum.Font.GothamMedium
-    local selectedId, minimized, alive = nil, false, true
-    local refs, actionInputs = {}, {}
+    local selectedId = nil
+    local refs, actionInputs, caseButtons = {}, {}, {}
     local experiment, notes
     local function corner(o, radius)
         local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, radius or 7); c.Parent = o
@@ -1053,24 +1136,90 @@ local function buildUI(Lab)
         local stats = snap.stats or snap.playerStats or {}
         return string.format("%s  •  %s  •  world %s  •  events %s  •  records %s", tostring(id.username or "player"), tostring(id.jobId or "server?"), tostring(snap.world or "?"), tostring(s.events or 0), tostring(s.records or 0))
     end
+    local function caseStatus(v, id)
+        local result = (v.results or {})[id]
+        if type(result) == "table" and result.status == "OBSERVED" and result.captured and result.saved then return "SAVED" end
+        return type(result) == "table" and tostring(result.status or "NOT_RUN") or "NOT_RUN"
+    end
+    local function statusMark(status)
+        if status == "PASS" then return "[PASS]" elseif status == "FAIL" then return "[FAIL]" elseif status == "SAVED" then return "[SAVED]" elseif status == "OBSERVED" then return "[OBSERVED]" elseif status == "RUNNING" then return "[~]" elseif status == "BLOCKED" then return "[BLOCKED]" elseif status == "ERROR" then return "[ERROR]" end
+        return "[ ]"
+    end
 
-    local root = frame(gui, C.bg, UDim2.new(1, 0, 1, 0)); root.BackgroundTransparency = .08
-    local top = Instance.new("Frame"); top.BackgroundColor3 = C.panel; top.BorderSizePixel = 0; top.Size = UDim2.new(1, 0, 0, 54); top.Parent = root
+    local root = frame(gui, C.bg, UDim2.new(0, 980, 0, 650)); root.Name = "SuiteWindow"; root.AnchorPoint = Vector2.new(0, 0); root.BackgroundTransparency = .08; root.ZIndex = 2
+    local function viewportSize()
+        local camera = workspace.CurrentCamera
+        if camera and camera.ViewportSize.X > 0 then return camera.ViewportSize end
+        return Vector2.new(gui.AbsoluteSize.X > 0 and gui.AbsoluteSize.X or 1024, gui.AbsoluteSize.Y > 0 and gui.AbsoluteSize.Y or 720)
+    end
+    local function bounds()
+        local vp = viewportSize(); local minW = math.min(850, math.max(1, vp.X - 12)); local minH = math.min(520, math.max(1, vp.Y - 12))
+        return vp, minW, minH
+    end
+    local vp, minW, minH = bounds(); local normal = {x = math.max(12, (vp.X - 980) / 2), y = math.max(12, (vp.Y - 650) / 2), w = math.min(980, vp.X - 24), h = math.min(650, vp.Y - 24)}
+    normal.w = math.max(minW, normal.w); normal.h = math.max(minH, normal.h)
+    root.Position = UDim2.fromOffset(normal.x, normal.y); root.Size = UDim2.fromOffset(normal.w, normal.h)
+    local maxed, minimized, alive = false, false, true
+    local top = Instance.new("Frame"); top.Name = "SuiteTitleBar"; top.BackgroundColor3 = C.panel; top.BorderSizePixel = 0; top.Size = UDim2.new(1, 0, 0, 54); top.Parent = root
     local title = label(top, "SLASH  /  EVIDENCE SUITE", 16, C.mint, true); title.Position = UDim2.new(0, 18, 0, 9); title.Size = UDim2.new(1, -280, 0, 22)
     local subtitle = label(top, "single-account observation and validation", 11, C.muted, false); subtitle.Position = UDim2.new(0, 19, 0, 31); subtitle.Size = UDim2.new(1, -280, 0, 16)
     local body
-    local minBtn
+    local minBtn, maxBtn
+    local windowState = {x = normal.x, y = normal.y, width = normal.w, height = normal.h, minimized = false, maximized = false}
+    local function constrain()
+        local view, lowW, lowH = bounds()
+        if maxed then
+            windowState.x, windowState.y, windowState.width, windowState.height = 0, 0, view.X, view.Y
+        else
+        windowState.width = math.clamp(windowState.width, lowW, math.max(1, view.X - 12)); windowState.height = math.clamp(windowState.height, lowH, math.max(1, view.Y - 12))
+        windowState.x = math.clamp(windowState.x, 6, math.max(6, view.X - windowState.width - 6)); windowState.y = math.clamp(windowState.y, 6, math.max(6, view.Y - windowState.height - 6))
+        normal = {x=windowState.x,y=windowState.y,w=windowState.width,h=windowState.height}
+        end
+        root.Position = UDim2.fromOffset(windowState.x, windowState.y); root.Size = UDim2.fromOffset(windowState.width, minimized and 54 or windowState.height)
+    end
+    local function applyWindow()
+        root.Position = UDim2.fromOffset(windowState.x, windowState.y); root.Size = UDim2.fromOffset(windowState.width, minimized and 54 or windowState.height); body.Visible = not minimized; root.BackgroundTransparency = minimized and 1 or .08
+        minBtn.Text = minimized and "RESTORE" or "MINIMIZE"; maxBtn.Text = maxed and "RESTORE" or "MAXIMIZE"
+    end
+    local function moveWindow(x, y) if maxed then return end; windowState.x, windowState.y = x, y; constrain(); normal.x, normal.y = windowState.x, windowState.y end
+    local function resizeWindow(w, h) if maxed or minimized then return end; windowState.width, windowState.height = w, h; constrain(); normal.w, normal.h = windowState.width, windowState.height end
+    local function minimizeWindow() minimized = true; windowState.minimized = true; applyWindow() end
+    local function restoreWindow()
+        local wasMinimized = minimized
+        minimized = false; windowState.minimized = false
+        if maxed and not wasMinimized then maxed = false; windowState.maximized = false; windowState.x, windowState.y, windowState.width, windowState.height = normal.x, normal.y, normal.w, normal.h end
+        constrain(); applyWindow()
+    end
+    local function maximizeWindow()
+        if not maxed then
+            if not minimized then normal = {x = windowState.x, y = windowState.y, w = windowState.width, h = windowState.height} end
+            local view = viewportSize(); maxed = true; minimized = false; windowState.maximized = true; windowState.minimized = false; windowState.x, windowState.y, windowState.width, windowState.height = 0, 0, view.X, view.Y
+        else maxed = false; windowState.maximized = false; windowState.x, windowState.y, windowState.width, windowState.height = normal.x, normal.y, normal.w, normal.h end
+        constrain()
+        applyWindow()
+    end
+    Lab.windowControls = {getState = function() return {x=windowState.x,y=windowState.y,width=windowState.width,height=windowState.height,minimized=minimized,maximized=maxed} end, move=moveWindow, resize=resizeWindow, minimize=minimizeWindow, maximize=maximizeWindow, restore=restoreWindow, constrain=constrain}
     minBtn = button(top, "MINIMIZE", function()
-        minimized = not minimized
-        if body then body.Visible = not minimized end
-        root.Size = minimized and UDim2.new(1, 0, 0, 54) or UDim2.new(1, 0, 1, 0)
-        root.BackgroundTransparency = minimized and 1 or .08
-        minBtn.Text = minimized and "OPEN" or "MINIMIZE"
+        if minimized then restoreWindow() else minimizeWindow() end
     end, C.panel2, 82); minBtn.Position = UDim2.new(1, -270, 0, 12)
+    maxBtn = button(top, "MAXIMIZE", maximizeWindow, C.panel2, 82); maxBtn.Name = "SuiteMaximizeButton"; maxBtn.Position = UDim2.new(1, -358, 0, 12)
+    minBtn.Name = "SuiteMinimizeButton"
     local stopBtn = button(top, "STOP", function() pcall(Lab.stop); refs.status.Text = "stopped (export remains available)" end, C.panel2, 54); stopBtn.Position = UDim2.new(1, -182, 0, 12)
-    local closeBtn = button(top, "CLOSE", function() pcall(Lab.stop); pcall(Lab.save); alive = false; pcall(Lab.close); if gui.Parent then gui:Destroy() end end, C.red, 54); closeBtn.Position = UDim2.new(1, -120, 0, 12)
+    local requestClose = function() end
+    local closeBtn = button(top, "CLOSE", function() requestClose() end, C.red, 54); closeBtn.Position = UDim2.new(1, -120, 0, 12)
 
     body = Instance.new("Frame"); body.BackgroundTransparency = 1; body.Position = UDim2.new(0, 10, 0, 62); body.Size = UDim2.new(1, -20, 1, -70); body.Parent = root
+    local dragZone = Instance.new("Frame"); dragZone.Name = "SuiteDragZone"; dragZone.BackgroundTransparency = 1; dragZone.Position = UDim2.new(0, 0, 0, 0); dragZone.Size = UDim2.new(1, -370, 0, 54); dragZone.ZIndex = 3; dragZone.Parent = top
+    local resizeHandle = Instance.new("TextButton"); resizeHandle.Name = "SuiteResizeHandle"; resizeHandle.Text = ""; resizeHandle.BackgroundTransparency = 1; resizeHandle.Size = UDim2.new(0, 22, 0, 22); resizeHandle.Position = UDim2.new(1, -22, 1, -22); resizeHandle.ZIndex = 4; resizeHandle.Parent = root
+    local dragging, resizing, dragStart, startState
+    local inputConnections = {}
+    table.insert(inputConnections, dragZone.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = true; dragStart = input.Position; startState = {x=windowState.x,y=windowState.y}; end end))
+    table.insert(inputConnections, resizeHandle.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then resizing = true; dragStart = input.Position; startState = {w=windowState.width,h=windowState.height}; end end))
+    table.insert(inputConnections, UIS.InputChanged:Connect(function(input) if not dragStart then return end; if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end; local d = input.Position - dragStart; if dragging then moveWindow(startState.x + d.X, startState.y + d.Y) elseif resizing then resizeWindow(startState.w + d.X, startState.h + d.Y) end end))
+    table.insert(inputConnections, UIS.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging, resizing, dragStart = false, false, nil end end))
+    table.insert(inputConnections, gui.Destroying:Connect(function() alive = false; for _, connection in ipairs(inputConnections) do pcall(function() connection:Disconnect() end) end end))
+    local camera = workspace.CurrentCamera
+    if camera then pcall(function() table.insert(inputConnections, camera:GetPropertyChangedSignal("ViewportSize"):Connect(function() if not maxed then constrain() else local size = viewportSize(); windowState.width, windowState.height = size.X, size.Y; applyWindow() end end)) end) end
     local left = frame(body, C.panel, UDim2.new(.29, -5, 1, 0)); left.Position = UDim2.new(0, 0, 0, 0)
     local right = frame(body, C.panel, UDim2.new(.71, -5, 1, 0)); right.Position = UDim2.new(.29, 10, 0, 0)
     label(left, "TEST PLAN", 13, C.mint, true).Position = UDim2.new(0, 12, 0, 10)
@@ -1087,6 +1236,11 @@ local function buildUI(Lab)
     local pendingCallback
     local modalGo = button(modal, "CONFIRM", function() modal.Visible = false; local callback = pendingCallback; pendingCallback = nil; if callback then callback() end end, C.mintDark, 110); modalGo.Position = UDim2.new(1, -138, 1, -48); modalGo.ZIndex = 31
     local function confirm(text, callback) modalText.Text = text; pendingCallback = callback; modal.Visible = true end
+    requestClose = function()
+        confirm("Close the suite? Export first if you need the evidence file. This will stop subscriptions and remove the window.", function()
+            pcall(Lab.stop); alive = false; pcall(Lab.close); if gui.Parent then gui:Destroy() end
+        end)
+    end
 
     local actionBox = frame(detail, C.panel2, UDim2.new(1, 0, 0, 0)); actionBox.AutomaticSize = Enum.AutomaticSize.Y; actionBox.LayoutOrder = 40
     label(actionBox, "ACTION CONSOLE", 13, C.mint, true).Position = UDim2.new(0, 12, 0, 10)
@@ -1170,6 +1324,7 @@ local function buildUI(Lab)
     stateBox = frame(detail, C.panel2, UDim2.new(1, 0, 0, 0)); stateBox.AutomaticSize = Enum.AutomaticSize.Y; stateBox.LayoutOrder = 50; list(stateBox, 4)
     local stateTitle = label(stateBox, "LIVE VIEW", 13, C.mint, true); stateTitle.Position = UDim2.new(0, 10, 0, 8)
     refs.status = label(stateBox, "connecting…", 11, C.muted, false); refs.status.Position = UDim2.new(0, 10, 0, 30); refs.status.Size = UDim2.new(1, -20, 0, 18)
+    refs.progress = label(stateBox, "cases: —", 11, C.muted, false); refs.progress.Position = UDim2.new(0, 10, 0, 49); refs.progress.Size = UDim2.new(1, -20, 0, 18)
     refs.live = label(stateBox, "", 11, C.text, false); refs.live.Position = UDim2.new(0, 10, 0, 51); refs.live.Size = UDim2.new(1, -20, 0, 0)
     local exportBox = frame(detail, C.panel2, UDim2.new(1, 0, 0, 0)); exportBox.AutomaticSize = Enum.AutomaticSize.Y; exportBox.LayoutOrder = 60; list(exportBox, 6)
     label(exportBox, "EXPORT", 13, C.mint, true).Position = UDim2.new(0, 10, 0, 8)
@@ -1179,8 +1334,9 @@ local function buildUI(Lab)
     local copy = button(exportBtns, "COPY", function() local ok, success, msg = pcall(Lab.copy); local rawOK, raw = pcall(Lab.exportJSON); if rawOK then exportText.Text = tostring(raw) end; refs.status.Text = ok and tostring(msg or safeView().message or (success and "copied" or "use JSON below")) or "clipboard unavailable; JSON below" end, C.panel, 76); copy.Position = UDim2.new(0, 82, 0, 0)
     local replay = button(exportBtns, "REPLAY (ISOLATED)", function() local ok, msg = pcall(Lab.replay); refs.status.Text = ok and tostring(msg or "synthetic replay complete") or tostring(msg) end, C.panel, 142); replay.Position = UDim2.new(0, 164, 0, 0)
 
+    local initialCaseView = safeView()
     for _, t in ipairs(Lab.tests or {}) do
-        local id = tostring(t.id); local b = button(listScroll, tostring(t.group or "NOW") .. "  /  " .. tostring(t.title or t.name or id), function() selectedId = id; pcall(Lab.selectTest, id); renderSelected(); refs.status.Text = "selected " .. id end, C.panel2, 0); b.Size = UDim2.new(1, 0, 0, 38); b.TextXAlignment = Enum.TextXAlignment.Left; b.TextWrapped = true
+        local id = tostring(t.id); local b = button(listScroll, statusMark(caseStatus(initialCaseView, id)) .. "  " .. tostring(t.group or "NOW") .. "  /  " .. tostring(t.title or t.name or id), function() selectedId = id; pcall(Lab.selectTest, id); renderSelected(); refs.status.Text = "selected " .. id end, C.panel2, 0); b.Size = UDim2.new(1, 0, 0, 38); b.TextXAlignment = Enum.TextXAlignment.Left; b.TextWrapped = true; caseButtons[id] = b
     end
     local initialView = safeView(); selectedId = initialView.selectedTestId or (Lab.tests and Lab.tests[1] and tostring(Lab.tests[1].id)); if selectedId then pcall(Lab.selectTest, selectedId) end; renderSelected()
     local function count(v)
@@ -1190,12 +1346,13 @@ local function buildUI(Lab)
     local function resultText(v)
         local r = (v.results or {})[selectedId or ""]
         if type(r) ~= "table" then return "NOT_RUN" end
-        return tostring(r.status or "NOT_RUN")
+        return tostring(r.status or "NOT_RUN") .. (r.captured and (r.saved and " / evidence SAVED" or " / evidence not saved") or " / After needed") .. (r.notes and r.notes ~= "" and (" / " .. tostring(r.notes)) or "")
     end
     task.spawn(function()
         while alive and gui.Parent do
             task.wait(1)
             local v = safeView(); if not alive or not gui.Parent then break end
+            title.Text = "SLASH  /  EVIDENCE SUITE  v" .. tostring(v.version or "1")
             local s = v.summary or {}; local snap = v.snapshot or {}; local shop = snap.shop; local drops = snap.drops or snap.currentDrops; local pos = snap.position
             local posText = type(pos) == "table" and (tostring(pos.X or pos.x or "?") .. "," .. tostring(pos.Z or pos.z or "?")) or tostring(pos or "—")
             local shopOffers = type(shop) == "table" and (shop.Offers or shop.offers) or nil
@@ -1212,6 +1369,8 @@ local function buildUI(Lab)
             if delta then local d = {}; for name, value in pairs(delta.stats or {}) do d[#d + 1] = tostring(name) .. " " .. tostring(value) end; deltaText = "\nLast observed deltas: " .. table.concat(d, ", ") .. "; pets +" .. tostring(#(delta.petsAdded or {})) .. " / -" .. tostring(#(delta.petsRemoved or {})) end
             refs.live.Text = statLine(v) .. "\nposition: " .. posText .. "  •  shop: " .. shopText .. "  •  drops: " .. dropText .. "  •  players: " .. tostring(#(v.players or {})) .. "\n" .. dropInfo .. "\ntrial: " .. active .. "  •  selected result: " .. resultText(v) .. "\nevents " .. tostring(s.events or 0) .. "  records " .. tostring(s.records or 0) .. "  dropped " .. tostring(s.dropped or 0) .. "  truncations " .. tostring(s.truncations or 0) .. "  saved parts " .. tostring(s.segments or 0) .. err .. deltaText .. "\nmessage: " .. tostring(v.message or "ready")
             preserve.Text = "Preserve lanes: " .. (v.preserveLanes and "ON (suite guard; manual touches remain possible)" or "OFF")
+            local cases = s.caseCounts or {}; refs.progress.Text = "cases saved " .. tostring(cases.saved or 0) .. "/" .. tostring(cases.total or #caseButtons) .. "  •  captured " .. tostring(cases.observed or 0) .. "  •  Saved = durable evidence; PASS = reviewed outcome"
+            for id, b in pairs(caseButtons) do local t = testById(id); if t then b.Text = statusMark(caseStatus(v, id)) .. "  " .. tostring(t.group or "NOW") .. "  /  " .. tostring(t.title or t.name or id) end end
             if v.message and v.message ~= "" then refs.status.Text = tostring(v.message) end
         end
     end)

@@ -1,6 +1,6 @@
 # Slash In-Game Test Suite
 
-Version **1.0.0** · primary testing account: **mxssyo**.
+Version **1.1.0** · primary testing account: **mxssyo**.
 
 This expands the working Lua recorder into one in-game information-gathering suite. It is **not the external platform**. Only your account needs it. A trade counterpart can use the normal game UI.
 
@@ -24,7 +24,18 @@ The panel opens on **T10: Charm Shop remote read**. No further idle recorder che
 4. Wait a few seconds and choose **AFTER**. The log includes position, offers/window, responses, inventory and game-window visibility. Add a note if needed. You can mark it **OBSERVED**; the actual evidence will be reviewed.
 5. Click **SAVE**. The message displays a `slash-suite-...-complete.json` filename in Potassium's workspace.
 
-Continue through useful cases in the same recording. Start a new trial for each separate experiment. Saving reconstructs history from readable segments and memory into one complete export. The in-game panel scrolls. **MINIMIZE** collapses it so you can play; **OPEN** restores it, and recording continues throughout.
+Continue through useful cases in the same recording. Start a new trial for each separate experiment. Saving reconstructs history from readable segments and memory into one complete export. Drag the title bar to move the window, drag its bottom-right corner to resize, and use **MAXIMIZE / RESTORE** or **MINIMIZE / RESTORE**. Recording continues while minimized. The suite uses an elevated GUI host when available and the highest display order to sit above ordinary game labels.
+
+## Test checklist
+
+All 22 cases appear in the test list. Each contains its prerequisites, steps and expected evidence. Work through them one at a time:
+
+1. Select a case and **START TRIAL**: its badge becomes **In progress**.
+2. Follow its steps and record **AFTER**: its badge becomes **Observed** when the before/after evidence is captured.
+3. Evidence written successfully to local segments becomes **Saved** automatically. Use **SAVE** to collect the recording into one complete JSON file to send back.
+4. A rejected action shows **Blocked** with the reason; an uncertain request or execution error shows **Error**. Add notes and use **BLOCKED** for a manual test that cannot be completed.
+
+The progress line counts saved cases. **Saved means the evidence was stored; PASS means a reviewed test outcome.** A request being sent or a file being saved never automatically proves the game mechanic passed. Starting a new trial, baseline or action clears that case's old completion indicator until new After evidence is captured. Earlier trials remain in the export. Checklist progress belongs to the current session; save before leaving.
 
 ## Suggested run order
 
@@ -60,7 +71,7 @@ Missing or streamed-out objects remain unknown. An enabled prompt, message or ob
 
 **Preserve cleared lanes** blocks suite rebirth requests while on. Explicitly enabling it sends disable requests for Auto Win and AutoRebirth; check the captured flags before preparation. It cannot block a Win pad you physically touch or an action another script performs.
 
-**STOP** stops observations and flushes available segments; exports still work. **SAVE** creates the complete export. **COPY** attempts clipboard export and supplies selectable JSON text as fallback. **CLOSE** attempts Save and then stops/closes; explicitly Save first, especially if the file API reports an error.
+**STOP** stops observations and flushes available segments; exports still work. **SAVE** creates the complete export. **COPY** attempts clipboard export and supplies selectable JSON text as fallback. **CLOSE** asks for confirmation before stopping and removing the window; use SAVE first if you need the complete file.
 
 ## Action boundaries
 
@@ -92,4 +103,4 @@ All capture data stays in local exports. Nothing is uploaded to GitHub or anothe
 
 Syntax and simulated client checks cover startup without gameplay requests, all 22 cases, read probes, request logging, budgets, repeat-purchase blocking, protected pets, trade holds, preservation, trial scoping, travel, bounded punches, replay without live calls, ambient aggregation, deltas, segment reconstruction, fallback export, stopping and panel construction/minimize.
 
-This is not an actual Roblox renderer or a live run of suite 1.0.0. The underlying recorder has run successfully in your live Potassium setup; the expanded UI and actions still need this planned run. See **COVERAGE.md** for requirement mappings and limits.
+This is not an actual Roblox renderer or a live run of suite 1.1.0. The underlying recorder has run successfully in your live Potassium setup; the expanded UI and actions still need this planned run. Version 1.1 checks also cover checklist transitions, saved evidence, blocked budgets, uncertain request errors, drag/resize inputs, viewport bounds and window restoration under a simulated Roblox API. See **COVERAGE.md** for requirement mappings and limits.
