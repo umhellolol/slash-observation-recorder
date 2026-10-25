@@ -1211,7 +1211,7 @@ local function buildUI(Lab)
             local delta = v.lastDelta; local deltaText = ""
             if delta then local d = {}; for name, value in pairs(delta.stats or {}) do d[#d + 1] = tostring(name) .. " " .. tostring(value) end; deltaText = "\nLast observed deltas: " .. table.concat(d, ", ") .. "; pets +" .. tostring(#(delta.petsAdded or {})) .. " / -" .. tostring(#(delta.petsRemoved or {})) end
             refs.live.Text = statLine(v) .. "\nposition: " .. posText .. "  •  shop: " .. shopText .. "  •  drops: " .. dropText .. "  •  players: " .. tostring(#(v.players or {})) .. "\n" .. dropInfo .. "\ntrial: " .. active .. "  •  selected result: " .. resultText(v) .. "\nevents " .. tostring(s.events or 0) .. "  records " .. tostring(s.records or 0) .. "  dropped " .. tostring(s.dropped or 0) .. "  truncations " .. tostring(s.truncations or 0) .. "  saved parts " .. tostring(s.segments or 0) .. err .. deltaText .. "\nmessage: " .. tostring(v.message or "ready")
-            preserve.Text = "Preserve cleared lanes: " .. (v.preserveLanes and "ON (protected)" or "OFF")
+            preserve.Text = "Preserve lanes: " .. (v.preserveLanes and "ON (suite guard; manual touches remain possible)" or "OFF")
             if v.message and v.message ~= "" then refs.status.Text = tostring(v.message) end
         end
     end)
