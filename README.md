@@ -59,3 +59,7 @@ This Lua script is the **in-game agent/observer**. A future external desktop con
 ## Validation status
 
 Syntax checks, a no-gameplay-server-call check, and simulated Lua lifecycle checks cover startup, subscriptions, heartbeat, event recording, quantity snapshots, optional export APIs, and stop behavior. The companion evidence workbench has focused logic and browser checks. A user-supplied v0.2.0 live capture confirms incoming-event reception, replicated state access and usable JSON export in one Potassium session. It also exposed rapid buffer eviction caused by repeated inventory snapshots. Simulated v0.3.0 tests include 2,500 ambient events without eviction. The retention correction still needs a follow-up live run, and Blade, trade, collection and reset rules remain unverified.
+
+## Comprehensive in-game test suite
+
+The recorder has been expanded into a single-account testing suite for mxssyo, with 22 guided cases, controlled probes, local evidence segments and isolated event-contract replay. This is still pre-platform information gathering. See [TEST-SUITE.md](TEST-SUITE.md) for the loadstring and run guide, and [TEST-COVERAGE.md](TEST-COVERAGE.md) for the requirement mapping. The original recorder.lua remains available.

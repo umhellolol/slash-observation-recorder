@@ -4,3 +4,5 @@ slash-capture-*.json
 .env
 .env.*
 node_modules/
+
+slash-suite-*.json
