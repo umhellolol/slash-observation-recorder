@@ -6,3 +6,5 @@ slash-capture-*.json
 node_modules/
 
 slash-suite-*.json
+Slash-Modifier-Observations-*.json
+Slash-Modifier-Experiment-*.json
