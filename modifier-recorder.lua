@@ -1,4 +1,4 @@
--- Slash Modifier Experiment v2.0.1 (diagnostic only)
+-- Slash Modifier Recorder v3.0.0 (diagnostic only)
 -- Edits only existing replicated client fields; never fires remotes or claims server success.
 local Players=game:GetService("Players")
 local Http=game:GetService("HttpService")
@@ -8,9 +8,9 @@ local KEY="SlashModifierRecorderV2"
 local old=env[KEY]
 if type(old)=="table" and old.running and old.focus then pcall(old.focus);print("Slash Modifier Experiment is already open.");return end
 if type(old)=="table" and old.running==false then env[KEY]=nil end
-if type(env.SlashModifierRecorder)=="table" and env.SlashModifierRecorder.running then env.SlashModifierRecorder.running=false end
+if type(env.SlashModifierRecorder)=="table" and env.SlashModifierRecorder.running then print("Close the older modifier recorder before starting v3 so its writes can restore safely.");return end
 local NOW=function()return DateTime.now().UnixTimestampMillis end
-local state={version="2.0.1",running=true,startedAt=NOW(),events={},writes={},trials={},trialStages={},originals={},lastWrites={},connections={},ui=nil,droppedWrites=0,droppedTrials=0}
+local state={version="3.0.0",running=true,startedAt=NOW(),events={},writes={},trials={},trialStages={},originals={},lastWrites={},connections={},testConnections={},boundRemotes={},testRunning=false,runId=0,ui=nil,droppedEvents=0,droppedWrites=0,droppedTrials=0,droppedRemoteEvents=0}
 env[KEY]=state
 local baseFactorNames={"FriendPowerPercent","AuraMultiplier","SwordPowerMultiplier","SwordWinsMultiplier","SwordAttackSpeedMultiplier","AdminPowerMultiplier","AdminWinsMultiplier","PetMultiplier","PowerMultiplier","WinsMultiplier"}
 local factorNames={};for _,n in ipairs(baseFactorNames)do factorNames[#factorNames+1]=n end
@@ -69,30 +69,55 @@ local function snapshot()
  local ps=player:FindFirstChild("PlayerStats");local ev=findValue(ps,"EquippedAura");out.factors.EquippedAura=ev and scalar(ev.Value)or scalar(ps and ps:GetAttribute("EquippedAura"))
  for _,n in ipairs({"EquippedCharms","OwnedCharms","SwordUnlocks","OwnedAuras","PetInventory"})do out.inventory[n]=folder(n)end;return out
 end
+local function roster()
+ local out={};local list=Players:GetPlayers();for i,p in ipairs(list)do if i>200 then break end;out[#out+1]={userId=p.UserId,name=safeText(p.Name,80)}end
+ return {players=out,truncated=#list>200}
+end
+local function observed(v,depth,seen)
+ depth=depth or 0;seen=seen or {_remaining=128};seen._remaining=seen._remaining-1;if seen._remaining<0 then state.payloadTruncations=(state.payloadTruncations or 0)+1;return "(payload limit)"end;if depth>3 then state.payloadTruncations=(state.payloadTruncations or 0)+1;return "(depth truncated)" end
+ if v==nil or finite(v) or type(v)=="boolean" then return v end
+ if type(v)=="string" then if #v>120 then state.payloadTruncations=(state.payloadTruncations or 0)+1 end;return safeText(v,120) end
+ if type(v)=="table" then if seen[v] then return "(cycle)" end;seen[v]=true;local out={};local n=0;for k,x in pairs(v)do n=n+1;if n>40 then state.payloadTruncations=(state.payloadTruncations or 0)+1;out._truncated=true;break end;local key=safeText(k,60);local lower=key:lower();if lower:find("token",1,true)or lower:find("cookie",1,true)or lower:find("password",1,true)or lower:find("secret",1,true)or lower:find("pairingkey",1,true)then out[key]="(redacted)"else out[key]=observed(x,depth+1,seen)end end;return out end
+ local ok,name=pcall(function()return v.GetFullName and v:GetFullName()end);return ok and {instance=safeText(name or tostring(v),160)}or safeText(v,120)
+end
+local testEvent
+local remoteLimit=200
+local function connectRemote(remote)
+ if not remote or state.boundRemotes[remote] then return end
+ if (state.remoteCount or 0)>=remoteLimit then state.remoteLimitReached=true;return end
+ state.boundRemotes[remote]=true;state.remoteCount=(state.remoteCount or 0)+1
+ local ok,conn=pcall(function()return remote.OnClientEvent:Connect(function(...)testEvent("incoming_event",{remote=safeText(remote:GetFullName(),180),args=observed(table.pack(...)),direction="server-to-client-observed"})end)end)
+ if ok and conn then state.testConnections[#state.testConnections+1]=conn;testEvent("route_subscribed",{remote=safeText(remote:GetFullName(),180),delivery="not yet observed"})else testEvent("route_error",{remote=safeText(remote:GetFullName(),180),message=safeText(conn)})end
+end
+local function connectKnownRemotes()
+ local okService,rs=pcall(function()return game:GetService("ReplicatedStorage")end);if not okService or not rs then return end
+ for _,route in ipairs({{"PunchEscapeRemotes","Effects"},{"PunchEscapeRemotes","TradeRemote"},{"PunchEscapeRemotes","SwordDropEvent"},{"PunchEscapeRemotes","CharmShopRequest"},{"PunchEscapeAdminRemotes","CharmShowerVisuals"},{"PunchEscapeAdminBladeRemotes","Event"},{"PetInventoryResult"},{"LuckyBlockOpenResult"}})do
+  local item=rs;for _,part in ipairs(route)do item=item and item:FindFirstChild(part)end
+  if item and item:IsA("RemoteEvent")then connectRemote(item)else testEvent("route_unavailable",{remote=table.concat(route,"."),status=item and "wrong class"or "not visible"})end
+ end
+ local count=0
+ for _,x in ipairs(rs:GetDescendants())do if count>=200 then break end;if x:IsA("RemoteEvent") then connectRemote(x);count=count+1 end end
+ if rs.DescendantAdded then state.testConnections[#state.testConnections+1]=rs.DescendantAdded:Connect(function(x)if state.testRunning and x:IsA("RemoteEvent")then connectRemote(x)end end)end
+ testEvent("remote_scan",{count=count,limit=200})
+ local service=Players
+ if service.PlayerAdded then state.testConnections[#state.testConnections+1]=service.PlayerAdded:Connect(function(p)testEvent("player_added",{userId=p.UserId,name=safeText(p.Name,80),friendPowerBefore=readField(fieldFor("FriendPowerPercent")),relationship="unknown"})end)end
+ if service.PlayerRemoving then state.testConnections[#state.testConnections+1]=service.PlayerRemoving:Connect(function(p)testEvent("player_removing",{userId=p.UserId,name=safeText(p.Name,80),friendPowerAtRemoval=readField(fieldFor("FriendPowerPercent")),relationship="unknown"})end)end
+end
 discoverFields()
 local function same(a,b)return type(a)==type(b)and a==b end
 local function diff(a,b)if finite(a)and finite(b)then return b-a end end
 local function logEvent(kind,data)
- if #state.events<2000 then state.events[#state.events+1]={observedAt=NOW(),kind=kind,data=clone(data)}
- else state.droppedEvents=(state.droppedEvents or 0)+1 end
+ if not state.testRunning and kind~="restore_all"and kind~="error"then return end
+ state.sequence=(state.sequence or 0)+1
+ local record={sequence=state.sequence,observedAt=NOW(),elapsedMs=NOW()-state.startedAt,kind=kind,data=clone(data)}
+ local ok,encoded=pcall(function()return Http:JSONEncode(record)end)
+ local bytes=ok and #encoded or 0
+ if ok and #state.events<10000 and (state.eventBytes or 0)+bytes<=4000000 then state.events[#state.events+1]=record;state.eventBytes=(state.eventBytes or 0)+bytes
+ else state.droppedEvents=(state.droppedEvents or 0)+1;if kind=="incoming_event"then state.droppedRemoteEvents=(state.droppedRemoteEvents or 0)+1 end end
 end
+
+testEvent=function(kind,data)if state.testRunning then logEvent(kind,data)end end
 local function recordWrite(row)if #state.writes<500 then state.writes[#state.writes+1]=row else state.droppedWrites=state.droppedWrites+1 end end
-local function capture(label)local s=snapshot();local prev=state.lastSnapshot;local deltas={};if prev then for _,n in ipairs(statNames)do local d=diff(prev.stats[n],s.stats[n]);if d~=nil then deltas[n]={before=numberText(prev.stats[n]),after=numberText(s.stats[n]),delta=numberText(d),precision="binary64-observed"}end end end;state.lastSnapshot=s;logEvent("capture",{label=safeText(label or "manual",80),snapshot=s,deltas=deltas});return s,deltas end
-local function captureStage(label)
- if label=="baseline_start"then state.trialStages={} end
- local phase=label:match("^(.-)_")
- if label:match("_start$")then state.trialStages[phase.."_result"]=nil end
- if label:match("_end$")then assert(state.trialStages[phase.."_start"],"Press "..phase.." start first")end
- local s,d=capture(label);state.trialStages[label]={at=NOW(),snapshot=s,deltas=d}
- local pair=(label=="baseline_end" and "baseline")or(label=="modified_end" and "modified")
- if pair and state.trialStages[pair.."_start"] then local a=state.trialStages[pair.."_start"].snapshot;local result={window=pair,elapsedMs=NOW()-state.trialStages[pair.."_start"].at,stats={}}
-  for _,n in ipairs(statNames)do local delta=diff(a.stats[n],s.stats[n]);if delta~=nil then result.stats[n]={before=numberText(a.stats[n]),after=numberText(s.stats[n]),delta=numberText(delta),precisionLimited=finite(a.stats[n]) and (math.abs(a.stats[n])>9007199254740992 or math.abs(s.stats[n])>9007199254740992)}end end
-  result.rewardEffect="UNVERIFIED: client-observed comparison only"
-  result.rebirthChanged=a.stats.Rebirths~=s.stats.Rebirths
-  state.trialStages[pair.."_result"]=result;logEvent("trial_result",result)
- end
- return s,d
-end
 local function fieldSame(a,b)return a and b and a.kind==b.kind and a.instance==b.instance and a.name==b.name end
 local function restoreOne(name)
  local w=state.lastWrites[name];if not w then return false,"not written by this run"end
@@ -102,6 +127,7 @@ local function restoreOne(name)
  local ok,err=writeField(w.field,w.original);if ok then state.lastWrites[name]=nil;recordWrite({at=NOW(),name=name,action="restore",value=w.original});return true end;return false,err
 end
 local function apply(name,requested)
+ if not state.testRunning then return false,"Press Start test before editing a value"end
  local n=tonumber(requested);if not finite(n)then return false,"enter a finite number"end
  local f=fieldFor(name);if not f then return false,"field is not present or not numeric"end
  local prior=state.lastWrites[name]
@@ -113,16 +139,16 @@ local function apply(name,requested)
 end
 local function restoreAll()local results={};for name in pairs(state.lastWrites)do local ran,ok,err=pcall(restoreOne,name);results[name]=ran and (ok and "restored"or err)or "Restore failed: "..tostring(ok)end;state.restoreResults=results;logEvent("restore_all",results);return results end
 local function export()
- local report={schemaVersion=2,version=state.version,startedAt=state.startedAt,endedAt=NOW(),placeId=tostring(game.PlaceId),jobId=tostring(game.JobId),initial=state.initial,events=state.events,droppedEvents=state.droppedEvents or 0,droppedWrites=state.droppedWrites,droppedTrials=state.droppedTrials,writes=state.writes,trials=state.trials,trialStages=state.trialStages,restoreResults=state.restoreResults,limitations={"Client-visible fields only; edited values are not proof of server acceptance.","No remotes were intercepted, fired or replayed.","Reward deltas are sampled observations; repeat the same action with one factor changed.","Large values retain exposed floating-point precision; abbreviated UI strings are excluded."}}
+ local report={schemaVersion=3,version=state.version,runId=state.runId,testRunning=state.testRunning,startedAt=state.startedAt,endedAt=state.endedAt or NOW(),roster=state.initialRoster,finalRoster=state.finalRoster,eventBytes=state.eventBytes,payloadTruncations=state.payloadTruncations,remoteCount=state.remoteCount,remoteLimitReached=state.remoteLimitReached,placeId=tostring(game.PlaceId),jobId=tostring(game.JobId),initial=state.initial,final=state.final,events=state.events,droppedEvents=state.droppedEvents or 0,droppedRemoteEvents=state.droppedRemoteEvents or 0,droppedWrites=state.droppedWrites,droppedTrials=state.droppedTrials,writes=state.writes,trials=state.trials,trialStages=state.trialStages,restoreResults=state.restoreResults,limitations={"Client-visible fields only; edited values are not proof of server acceptance.","Incoming events are server-to-client observations; no remotes were fired, replayed or hooked.","Reward deltas are sampled observations; repeat the same action with one factor changed.","Large values retain exposed floating-point precision; abbreviated UI strings are excluded."}}
  local ok,payload=pcall(function()return Http:JSONEncode(report)end);if not ok then warn("Export failed: "..tostring(payload));return nil,"JSON encode failed: "..tostring(payload)end
- state.report=report;state.json=payload;local name="Slash-Modifier-Experiment-"..tostring(state.startedAt)..".json";state.export={name=name,ok=false,reason="no local write API"}
+ state.report=report;state.json=payload;local name="Slash-Modifier-Experiment-"..tostring(state.startedAt).."-run"..tostring(state.runId)..".json";state.export={name=name,ok=false,reason="no local write API"}
  if type(writefile)=="function"then local wrote,werr=pcall(writefile,name,payload);if wrote and type(readfile)=="function"then local rok,readback=pcall(readfile,name);if rok and readback==payload then state.export={name=name,ok=true,verified=true};else state.export={name=name,ok=false,written=true,reason="readback mismatch or failed"}end elseif wrote then state.export={name=name,ok=true,written=true,verified=false,reason="write succeeded; readback API unavailable"}else state.export={name=name,ok=false,reason=tostring(werr)}end end
  if type(setclipboard)=="function" then local cok=pcall(setclipboard,payload);state.export.clipboard=cok end
  local msg=state.export.verified and "Export verified: "..name or state.export.written and "File written; readback unverified: "..name or state.export.clipboard and "JSON copied to clipboard; file not verified" or "File/clipboard unavailable; use Show JSON to select and copy"
  return payload,msg end
 local gui=Instance.new("ScreenGui");gui.Name="SlashModifierExperiment";gui.ResetOnSpawn=false;gui.DisplayOrder=999;gui.Parent=player:WaitForChild("PlayerGui");state.ui=gui
 local frame=Instance.new("Frame");frame.Visible=true;frame.Size=UDim2.fromOffset(640,520);frame.Position=UDim2.new(.5,-320,.5,-260);frame.BackgroundColor3=Color3.fromRGB(22,25,33);frame.Parent=gui
-local title=Instance.new("TextLabel");title.Size=UDim2.new(1,-44,0,34);title.Text="SLASH / MODIFIER EXPERIMENT v2";title.TextColor3=Color3.new(1,1,1);title.BackgroundTransparency=1;title.Parent=frame
+local title=Instance.new("TextLabel");title.Size=UDim2.new(1,-44,0,34);title.Text="SLASH / EVENT RECORDER v3";title.TextColor3=Color3.new(1,1,1);title.BackgroundTransparency=1;title.Parent=frame
 local close=Instance.new("TextButton");close.Size=UDim2.fromOffset(34,30);close.Position=UDim2.new(1,-38,0,2);close.Text="×";close.Parent=frame
 local status=Instance.new("TextLabel");status.Size=UDim2.new(1,-20,0,42);status.Position=UDim2.fromOffset(10,35);status.TextWrapped=true;status.TextXAlignment=Enum.TextXAlignment.Left;status.Text="Only existing client fields can be tested. Server acceptance is unknown.";status.TextColor3=Color3.fromRGB(255,205,120);status.BackgroundTransparency=1;status.Parent=frame
 local scroll=Instance.new("ScrollingFrame");scroll.Size=UDim2.new(1,-20,1,-185);scroll.Position=UDim2.fromOffset(10,82);scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y;scroll.BackgroundColor3=Color3.fromRGB(30,34,44);scroll.Parent=frame
@@ -150,28 +176,36 @@ local function makeRow(name)
 end
 for _,name in ipairs(factorNames)do makeRow(name)end
 local function button(text,x,parent)local b=Instance.new("TextButton");b.Size=UDim2.fromOffset(105,30);b.Position=UDim2.fromOffset(x,0);b.Text=text;b.Parent=parent;return b end
-local controls=Instance.new("Frame");controls.Size=UDim2.new(1,-20,0,34);controls.Position=UDim2.new(0,10,1,-55);controls.BackgroundTransparency=1;controls.Parent=frame
-local baselineStart=button("Baseline start",0,controls);local baselineEnd=button("Baseline end",110,controls);local modifiedStart=button("Modified start",220,controls);local modifiedEnd=button("Modified end",330,controls)
+local controls=Instance.new("Frame");controls.Name="TestControls";controls.Size=UDim2.new(1,-20,0,34);controls.Position=UDim2.new(0,10,1,-55);controls.BackgroundTransparency=1;controls.Parent=frame
+local startTest=button("Start test",0,controls);startTest.Name="StartTest";local stopTestButton=button("Stop test",110,controls);stopTestButton.Name="StopTest"
 local trialControls=Instance.new("Frame");trialControls.Size=UDim2.new(1,-20,0,34);trialControls.Position=UDim2.new(0,10,1,-90);trialControls.BackgroundTransparency=1;trialControls.Parent=frame
 local restore=button("Restore all",0,trialControls);local save=button("Export",110,trialControls)
 local show=button("Show JSON",220,trialControls)
 local jsonBox=Instance.new("TextBox");jsonBox.Name="ExportJSON";jsonBox.Size=UDim2.new(1,-20,0,300);jsonBox.Position=UDim2.fromOffset(10,82);jsonBox.MultiLine=true;jsonBox.ClearTextOnFocus=false;jsonBox.TextEditable=false;jsonBox.TextSize=12;jsonBox.TextXAlignment=Enum.TextXAlignment.Left;jsonBox.TextYAlignment=Enum.TextYAlignment.Top;jsonBox.Visible=false;jsonBox.Parent=frame
 show.MouseButton1Click:Connect(function()callback(function()if jsonBox.Visible then jsonBox.Visible=false;scroll.Visible=true;show.Text="Show JSON"else local p,msg=export();if p then jsonBox.Text=p;jsonBox.Visible=true;scroll.Visible=false;show.Text="Hide JSON"end;setStatus(msg)end end)end)
-local function stage(label)
- callback(function()local s,d=captureStage(label);if #state.trials<100 then state.trials[#state.trials+1]={label=label,at=NOW(),snapshot=s,deltas=d}else state.droppedTrials=state.droppedTrials+1 end;local result=label:match("_end$") and state.trialStages[label:gsub("_end$","_result")] or nil;local text=label.." captured. Perform the matched action, then press End.";if result then local p=result.stats.Power;local w=result.stats.Wins;text=result.window.." observed: Power "..(p and p.delta or "unavailable").."; Wins "..(w and w.delta or "unavailable")..". Server effect unverified."end;setStatus(text)end)
+local function disconnectTest()for i,c in ipairs(state.testConnections)do pcall(function()c:Disconnect()end);state.testConnections[i]=nil end;state.boundRemotes={}end
+local function beginTest()
+ if state.testRunning then setStatus("Test already running");return end
+ state.runId=state.runId+1;state.startedAt=NOW();state.endedAt=nil;state.initial=snapshot();state.lastSnapshot=state.initial;state.initialRoster=roster();state.final=nil;state.finalRoster=nil
+ state.events={};state.writes={};state.trials={};state.trialStages={};state.restoreResults=nil;state.droppedEvents=0;state.droppedWrites=0;state.droppedTrials=0;state.droppedRemoteEvents=0;state.payloadTruncations=0;state.eventBytes=0;state.sequence=0;state.remoteCount=0;state.remoteLimitReached=false;state.nextHeartbeat=NOW()+5000
+ state.testRunning=true;testEvent("test_started",{runId=state.runId,at=state.startedAt});connectKnownRemotes();setStatus("Recording. Have your friend join/leave and play normally, then Stop test.")
 end
-baselineStart.MouseButton1Click:Connect(function()stage("baseline_start")end);baselineEnd.MouseButton1Click:Connect(function()stage("baseline_end")end);modifiedStart.MouseButton1Click:Connect(function()stage("modified_start")end);modifiedEnd.MouseButton1Click:Connect(function()stage("modified_end")end)
+local function endTest()
+ if not state.testRunning then setStatus("No test is running");return end
+ state.final=snapshot();state.finalRoster=roster();state.endedAt=NOW();testEvent("test_stopped",{runId=state.runId,at=state.endedAt});state.testRunning=false;disconnectTest();state.restoreResults=restoreAll();local _,msg=export();setStatus("Test stopped. "..(msg or "Export retained for copying."))
+end
+startTest.MouseButton1Click:Connect(function()callback(beginTest)end);stopTestButton.MouseButton1Click:Connect(function()callback(endTest)end)
 restore.MouseButton1Click:Connect(function()callback(function()restoreAll();setStatus("Restore results recorded; changed/replaced fields were left untouched.")end)end)
 save.MouseButton1Click:Connect(function()callback(function()local p,msg=export();setStatus(p and msg or "Export failed; copy the selectable JSON from the recorder state.")end)end)
 local function disconnectAll()for i,c in ipairs(state.connections)do pcall(function()c:Disconnect()end);state.connections[i]=nil end end
 local function stop(reason)
  if not state.running then return end
- state.running=false;state.stopReason=reason or "closed";state.restoreResults=restoreAll();disconnectAll();local _,msg=export();if state.ui then pcall(function()state.ui:Destroy()end);state.ui=nil end;env.SlashModifierRecorderV2Last=state;if env[KEY]==state then env[KEY]=nil end;state.focus=nil;setStatus(msg or "Stopped")
+ state.running=false;state.stopReason=reason or "closed";if state.testRunning then endTest()end;state.restoreResults=restoreAll();disconnectAll();local _,msg=export();if state.ui then pcall(function()state.ui:Destroy()end);state.ui=nil end;env.SlashModifierRecorderV2Last=state;if env[KEY]==state then env[KEY]=nil end;state.focus=nil;setStatus(msg or "Stopped")
 end
 close.MouseButton1Click:Connect(function()callback(function()stop("closed by user")end)end)
 state.focus=function()if gui and gui.Parent then gui.Enabled=true;frame.Visible=true;toggle.Text="Hide modifier panel"end end
-state.initial=snapshot();capture("startup")
-local char=player.CharacterAdded:Connect(function()callback(function()logEvent("character_replaced",{});if state.running then restoreAll();state.trialStages={};state.lastSnapshot=snapshot();capture("character_replaced");setStatus("Character changed; comparison cleared and restore attempted. Relaunch to rescan replaced item fields.")end end)end);state.connections[#state.connections+1]=char
+state.initial=snapshot()
+local char=player.CharacterAdded:Connect(function()callback(function()testEvent("character_replaced",{});if state.running then restoreAll();state.trialStages={};state.lastSnapshot=snapshot();if state.testRunning then testEvent("character_snapshot",state.lastSnapshot)end;setStatus("Character changed; comparison cleared and restore attempted.")end end)end);state.connections[#state.connections+1]=char
 task.spawn(function()
  local previous=state.lastSnapshot
  local ok,err=pcall(function()
@@ -184,10 +218,17 @@ task.spawn(function()
     end
    end
    for name,row in pairs(rows)do local f=fieldFor(name);local v=readField(f);row.current.Text="current: "..numberText(v);local w=state.lastWrites[name];row.original.Text="original: "..numberText(w and w.original or f and f.original)end
-   if previous then for _,n in ipairs(statNames)do local d=diff(previous.stats[n],current.stats[n]);if d~=nil and d~=0 then logEvent("stat_change",{name=n,before=numberText(previous.stats[n]),after=numberText(current.stats[n]),delta=numberText(d),precision="binary64-observed",precisionLimited=math.abs(previous.stats[n])>9007199254740991 or math.abs(current.stats[n])>9007199254740991})end end end
+   if state.testRunning and state.lastRunId~=state.runId then previous=state.initial;state.lastRunId=state.runId end
+   if previous and state.testRunning then for _,n in ipairs(statNames)do local d=diff(previous.stats[n],current.stats[n]);if d~=nil and d~=0 then testEvent("stat_change",{name=n,before=numberText(previous.stats[n]),after=numberText(current.stats[n]),delta=numberText(d),precision="binary64-observed",precisionLimited=math.abs(previous.stats[n])>9007199254740992 or math.abs(current.stats[n])>9007199254740992})end end end
+   if previous and state.testRunning and not same(previous.factors.FriendPowerPercent,current.factors.FriendPowerPercent) then testEvent("friend_boost_transition",{before=numberText(previous.factors.FriendPowerPercent),after=numberText(current.factors.FriendPowerPercent),authority="unknown"})end
+   if previous and state.testRunning then
+    for name,v in pairs(current.factors)do if name~="FriendPowerPercent" and not same(v,previous.factors[name])then testEvent("modifier_transition",{name=name,before=previous.factors[name],after=v,authority="unknown"})end end
+    for name,rows in pairs(current.inventory)do local ok,a=pcall(function()return Http:JSONEncode(rows)end);local ok2,b=pcall(function()return Http:JSONEncode(previous.inventory[name])end);if ok and ok2 and a~=b then testEvent("inventory_transition",{folder=name,observation=rows})end end
+    if NOW()>=(state.nextHeartbeat or 0)then testEvent("heartbeat",{stats=current.stats,friendPower=current.factors.FriendPowerPercent,eventCount=#state.events,incomingRoutes=state.remoteCount});state.nextHeartbeat=NOW()+5000 end
+   end
    previous=current;state.lastSnapshot=current;task.wait(.25)
   end
  end)
  if not ok then logEvent("error",{message=tostring(err)});setStatus("Recorder error: "..tostring(err));stop("runtime error") elseif state.running then stop("15 minute limit") end
 end)
-print("Slash Modifier Experiment v2 started. Use the in-game panel and matched baseline/after trials.")
+print("Slash Modifier Recorder v3 idle. Press Start test to capture client-visible transitions.")
