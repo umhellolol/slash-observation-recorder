@@ -1,29 +1,46 @@
-# Friend boost probe
+# Friend Boost Observer 2.0.0
 
-Sole purpose: investigate whether an existing local FriendPowerPercent edit changes observed gameplay gains, while collecting nearby incoming events and confounds. It does not grant a server-side boost or claim that this route can spoof one. Generic recorder v3 and Slash are unchanged.
+Investigates what the client sends and receives when a friend joins or leaves, alongside observed Power gains. This replaces the old three-phase local-value editor. It does not edit any game values, send or replay gameplay requests, move the character, or grant a boost. The main Slash application and the general modifier recorder are unchanged.
 
-Close the old recorder panel with × first. Launch:
+## Run
+
+Close the older probe/modifier recorder with **×** first. Join the game and run:
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/umhellolol/slash-observation-recorder/main/friend-boost-probe.lua"))()
 ```
 
-Keep one normal training/action running consistently. Enter the requested boost (default 100000) and seconds per phase (default 10), then press **Start test**. It automatically measures normal → locally edited → restored, then stops and exports after about 30 seconds. **Stop test** cancels early, attempts restoration and exports an incomplete comparison. Hide/show leaves the test running. **Show JSON** provides selectable export text if local file/clipboard APIs fail.
+For a reproducible capture use the commit-pinned URL supplied with the release. The `main` URL follows updates.
 
-During this controlled comparison, keep friends, equipment, world and activity unchanged. A player joining/leaving, a character change, observed world/loadout/training-setting change, reversion or failed restoration invalidates the comparison. Friend join/leave events are still captured for diagnosis; they are not asserted to prove friendship or server authority.
+1. Use normal training with observable Power gains and keep equipment, world and training mode unchanged. Plain Train Power avoids rebirth resets obscuring the comparison; the observer itself does not change AutoRebirth.
+2. Press **Start**. Record about 10 seconds before the friend joins, at least 10 seconds with them present, and another 10 seconds after they leave. Keep the same activity running throughout. These are recording windows, not automatic phases or timed edits.
+3. Press **Stop + save**. The panel reports the outgoing capability and observed call count. `installed` is a hook-installation result, not proof that calls were seen. Zero calls with `unsupported_executor` means coverage was unavailable.
+4. Use the exported `Slash-Friend-Boost-Observer-<timestamp>-run<N>.json`. File contents are read back and compared when `readfile` is available. Otherwise the panel explicitly reports an unverified write, clipboard export, or **Show JSON** fallback. Files are in the executor's workspace, not automatically in Downloads.
 
-The report includes raw NumericStats values, positive gains, negative changes/reset counts, actual phase durations/sample counts, gain rates, boost write/restoration, incoming client-visible RemoteEvent payloads (up to 100 subscribed routes), truncations and missing-event counts. Context is observed through known fields, not all hidden game state. No outgoing requests, remote hooks/replay, guessed server calls or private server scripts are used.
+Friend joins/leaves continue the recording. **Show JSON** is available after Stop. Hide/show leaves capture running. Closing an active panel stops and exports first. Reopening reuses a dormant pass-through observer instead of stacking another hook. It does not replace other tools' hooks on Stop; another tool replacing/bypassing the hook can silently reduce coverage.
 
-Interpretation is deliberately limited:
+## Evidence collected
 
-- INCONCLUSIVE: no usable repeated gains, unfinished phases, invalidation, unstable controls or insufficient numeric precision.
-- NO_OBSERVABLE_EFFECT_IN_THIS_RUN: at least one measured non-resetting, non-precision-limited counter had positive rates in all phases; normal/restored rates agreed within 10%, and the edited rate was within 10% of their mean. This threshold is a screening heuristic, not statistical proof or proof that every spoof route is impossible.
-- OBSERVED_CHANGE_UNVERIFIED: an eligible edited rate differed by more than 10%, upward or downward. Repeat with matched actions; this is not a confirmed server-side effect.
+- One timestamped, sequenced timeline of outgoing requests, incoming RemoteEvents, friend joins/leaves, boost changes, character replacement, stat changes and context changes.
+- Initial/final raw Power, Wins, Rebirths and Crystals with stat paths, missing counters and binary64 precision warnings. Stat Changed signals capture changes between polls; replacement/context polling runs every 250ms.
+- Context includes observed world, training pad, AutoRebirth, sword, aura, equipped pets/charms, visible multipliers and roster. A joining player is not automatically classified as a friend.
+- Descriptive gain segments split on observed roster/boost/loadout/training/character changes. Positive gains, negative changes/reset counts and rates are separate. Deltas crossing a changed context are excluded from segment totals and counted as ambiguous; whole-run totals retain them. Rates do not establish causation.
+- Per-route class, payload policy, subscription success/error and late-discovered remotes. Prioritizes PunchPowerFeedback and Effects; subscriptions are distinct from message delivery.
 
-Power resets are recorded separately from positive gains. Metrics with resets or exposed values beyond exact binary64 integer precision are excluded from the automatic verdict; raw observations remain in the export. Gameplay action counts and private award calculations are not verified. A completed report cannot certify persistence across rejoining.
+Only exact known gameplay routes directly under `ReplicatedStorage.PunchEscapeRemotes` retain bounded argument details: PunchRequest, PunchPowerFeedback, Effects, SlashSoundRequest, AFKExitRequest, AutoWinRequest, SettingsPreferenceRequest, RebirthRequest and MovementSpeedRequest. Vector3 components and argument counts (including nil positions) are retained. Other visible ReplicatedStorage routes retain timing/name/class/method/count metadata only, including chat/trade/admin routes. Their payloads are not retained. Common credential keys within retained tables are redacted; review identity and game text before sharing. Captures are not uploaded automatically.
 
-Exports are `Slash-Friend-Boost-Probe-<timestamp>-run<number>.json` in the executor workspace. Readback is verified when available; otherwise the panel states that the write is unverified or offers clipboard/Show JSON. Baseline/final snapshots and phases are retained separately from a timeline capped at 3000 events/two million encoded bytes. Incoming payloads are bounded and common sensitive keys redacted; review user/server identifiers and game-event text before sharing.
+Outgoing observation uses feature-detected `hookmetamethod` and `getnamecallmethod`, based on [Potassium's documented hook interface](https://docs.potassium.pro/api-reference/Metatable%20Library/hookmetamethod). Installation can be `installed`, `installed_reused`, `unsupported_executor` or `install_error`. Serialization is queued outside the hook; observation errors do not intentionally suppress, repeat or alter the original request/returns/errors. No diagnostic calls are sent to test the hook.
 
-Edits use only an already existing numeric field. There is no repeated forcing after an external overwrite. Stop/close uses compare-and-swap restoration; a changed or replaced field is left untouched. A client crash/disconnect can prevent restoration; no server rollback is promised.
+## Limits and interpretation
 
-Validation: actual Lua and GUI callbacks pass isolated tests for phase timing/gain aggregation, unchanged/changed/inconclusive classifications, finite input, early Stop, restart-generation isolation, external overwrite protection, roster/loadout invalidation, incoming payload redaction, listener cleanup, verified export and export-failure text fallback. These tests are isolated fixtures; live reward effects remain unverified.
+This is client evidence, not access to private server code, variables, friendship checks or award calculations. It cannot promise to discover a spoof. Incoming callbacks and locally visible stats can be manipulated; their correlation is not authenticated proof of server acceptance or persistence.
+
+The namecall hook cannot guarantee all outgoing traffic: direct function calls, replaced hooks, other runtimes, calls outside the recording and executor incompatibilities can bypass it. InvokeServer return values and incoming RemoteFunction callbacks are not intercepted. Missing subscriptions/calls do not establish that no event happened.
+
+Retention is bounded to 12,000 events/four million encoded event bytes, a 512-entry pending queue, 200 routes, 256 comparison segments, and 200 items scanned per context inventory. Changed-stat/setting listeners cap at 128 bindings per run; polling continues if that limit is reached. Payloads cap at 24 positional arguments, depth four, 128 visited nodes, 32 table fields and 160-character strings. Drops, limits and truncations are reported; initial/final snapshots are retained separately. Polling may miss brief context transitions, resets and batched updates can obscure gains, and large counters have rounding limits.
+
+## Verification
+
+Actual production Lua and GUI callbacks pass isolated tests for Start/Stop, join/leave continuation, gain signals/segments, late subscriptions, unsupported capture, pass-through multiple returns/original errors, observation-error isolation, Stop queue draining, restart fencing, reload without hook stacking, credential redaction, metadata-only payload exclusion, overflow reporting, verified export and failed file/clipboard fallback. Source checks exclude local value writes and gameplay remote calls. These fixtures remain outside the shipped application.
+
+**Live Roblox/Potassium capture and real reward behavior remain unverified:** the target PC is not connected to this session. Installation status and subsequent live captures must be assessed as evidence, not assumed success. No arbitrary friend boost has been established.

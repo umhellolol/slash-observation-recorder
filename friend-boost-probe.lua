@@ -1,148 +1,344 @@
--- Friend boost probe 1.0: controlled local-field experiment, not a server grant.
+-- Slash Friend Boost Observer 2.0.0. Client observations, never a server grant.
 local Players=game:GetService("Players")
-local Http=game:GetService("HttpService")
 local RS=game:GetService("ReplicatedStorage")
+local HTTP=game:GetService("HttpService")
 local player=assert(Players.LocalPlayer,"Join the game before launching")
-local env=type(getgenv)=="function"and getgenv()or _G
+local env=type(getgenv)=="function" and getgenv() or _G
 local KEY="SlashFriendBoostProbe"
-if env[KEY]and env[KEY].running then env[KEY].focus();return end
-if env.SlashModifierRecorderV2 and env.SlashModifierRecorderV2.running then warn("Close the modifier recorder with × before starting this probe");return end
-local S={running=true,active=false,runId=0,events={},phases={},invalidations={}}
+local HOOK="SlashFriendBoostNamecallObserver2"
+local prior=env[KEY]
+if type(prior)=="table" and prior.running then if prior.focus then prior.focus() end;return end
+if type(env.SlashModifierRecorderV2)=="table" and env.SlashModifierRecorderV2.running then
+ warn("Close the modifier recorder with × before starting this observer");return
+end
+local LIMIT={events=12000,bytes=4000000,queue=512,routes=200,segments=256,inventory=200}
+local S={version="2.0.0",running=true,active=false,generation=0,runId=0,events={},connections={}}
 env[KEY]=S
-local function now()return DateTime.now().UnixTimestampMillis end
-local function finite(v)return type(v)=="number"and v==v and math.abs(v)~=math.huge end
-local function text(v)return finite(v)and string.format("%.17g",v)or tostring(v)end
-local function field()
- if finite(player:GetAttribute("FriendPowerPercent"))then return {object=player,attribute=true}end
- local ps=player:FindFirstChild("PlayerStats");local v=ps and ps:FindFirstChild("FriendPowerPercent")
- if v and(v:IsA("NumberValue")or v:IsA("IntValue"))and finite(v.Value)then return {object=v}end
+local status,frame,jsonBox
+local function now() return DateTime.now().UnixTimestampMillis end
+local function finite(v) return type(v)=="number" and v==v and math.abs(v)~=math.huge end
+local function number(v) return finite(v) and string.format("%.17g",v) or tostring(v) end
+local function safe(v,n) return tostring(v or ""):sub(1,n or 160) end
+local function tell(v) if status then status.Text=safe(v,600) end end
+local function trunc() S.truncated=(S.truncated or 0)+1 end
+local function clean(v,depth,budget,seen)
+ depth=depth or 0;budget=budget or {n=128};seen=seen or {}
+ budget.n=budget.n-1
+ if budget.n<0 or depth>4 then trunc();return "(truncated)" end
+ if v==nil or type(v)=="boolean" or finite(v) then return v end
+ if type(v)=="string" then if #v>160 then trunc() end;return v:sub(1,160) end
+ local kind=typeof(v)
+ if kind=="Vector3" then return {type="Vector3",x=number(v.X),y=number(v.Y),z=number(v.Z)} end
+ if kind=="Instance" then return {instance=safe(v:GetFullName(),220),class=safe(v.ClassName,60)} end
+ if type(v)=="table" then
+  if seen[v] then return "(cycle)" end;seen[v]=true
+  local out={};local count=0
+  for k,x in pairs(v) do
+   count=count+1;if count>32 then trunc();out._truncated=true;break end
+   local key=safe(k,64);local lower=key:lower()
+   if lower:find("token",1,true) or lower:find("cookie",1,true) or lower:find("password",1,true) or lower:find("secret",1,true) or lower:find("pairingkey",1,true) then
+    out[key]="(redacted)"
+   else out[key]=clean(x,depth+1,budget,seen) end
+  end
+  return out
+ end
+ return safe(v,160)
 end
-local function read(f)if not f then return nil end;if f.attribute then return f.object:GetAttribute("FriendPowerPercent")end;return f.object.Value end
-local function same(a,b)return a and b and a.object==b.object and a.attribute==b.attribute end
-local function write(f,v)if f.attribute then f.object:SetAttribute("FriendPowerPercent",v)else f.object.Value=v end end
-local function snapshot()
- local ns=player:FindFirstChild("NumericStats");local stats,raw={},{}
- for _,name in ipairs({"Power","Wins","Rebirths"})do local v=ns and ns:FindFirstChild(name);if v and finite(v.Value)then stats[name]=v.Value;raw[name]={value=text(v.Value),precision="binary64",limited=math.abs(v.Value)>9007199254740991}end end
- local attrs=player:GetAttributes();local context={};for _,name in ipairs({"CurrentWorld","EquippedSword","AuraMultiplier","PetMultiplier","SwordPowerMultiplier","SwordWinsMultiplier","PowerMultiplier","WinsMultiplier"})do local v=attrs[name];if type(v)=="string"or type(v)=="boolean"or finite(v)then context[name]=v end end
- local ps=player:FindFirstChild("PlayerStats");local aura=ps and ps:FindFirstChild("EquippedAura");if aura then context.EquippedAura=aura.Value end
- for _,name in ipairs({"AutoRebirth","AFKPad"})do local item=ps and ps:FindFirstChild(name);if item then context[name]=item.Value end end
- local charmFolder=player:FindFirstChild("EquippedCharms");if charmFolder then local equipped={};for _,slot in ipairs(charmFolder:GetChildren())do if slot:IsA("ValueBase")then equipped[#equipped+1]=slot.Name.."="..tostring(slot.Value)end end;table.sort(equipped);context.charms=table.concat(equipped,";")end
- return {at=now(),stats=stats,raw=raw,boost=read(field()),context=context}
-end
-local function equivalent(a,b)for k,v in pairs(a)do if b[k]~=v then return false end end;for k,v in pairs(b)do if a[k]~=v then return false end end;return true end
-local function record(kind,data)
- S.seq=(S.seq or 0)+1;local row={sequence=S.seq,at=now(),elapsedMs=now()-(S.startedAt or now()),phase=S.phase,kind=kind,data=data}
- local ok,j=pcall(function()return Http:JSONEncode(row)end)
- if ok and #S.events<3000 and(S.bytes or 0)+#j<=2000000 then S.events[#S.events+1]=row;S.bytes=(S.bytes or 0)+#j else S.dropped=(S.dropped or 0)+1 end
-end
-local function invalidate(reason)if not S.invalidations[reason]then S.invalidations[reason]=true;record("comparison_invalid",{reason=reason})end end
-local function sanitize(v,depth,budget,seen)
- depth=depth or 0;budget=budget or {n=100};seen=seen or {};budget.n=budget.n-1
- if budget.n<0 or depth>3 then S.truncated=(S.truncated or 0)+1;return "(truncated)"end
- if v==nil or type(v)=="boolean"or finite(v)then return v end
- if type(v)=="string"then if #v>120 then S.truncated=(S.truncated or 0)+1 end;return v:sub(1,120)end
- if typeof(v)=="Instance"then return {instance=v:GetFullName():sub(1,160)}end
- if type(v)=="table"then if seen[v]then return "(cycle)"end;seen[v]=true;local out={};local n=0;for k,x in pairs(v)do n=n+1;if n>30 then out._truncated=true;S.truncated=(S.truncated or 0)+1;break end;local key=tostring(k):sub(1,60);local lower=key:lower();if lower:find("token",1,true)or lower:find("cookie",1,true)or lower:find("password",1,true)or lower:find("secret",1,true)then out[key]="(redacted)"else out[key]=sanitize(x,depth+1,budget,seen)end end;return out end
- return tostring(v):sub(1,120)
-end
-local function restore()
- if not S.owned then return true end
- local owned=S.owned;local f=field()
- if not same(f,owned.field)or read(f)~=owned.observed then S.restore={ok=false,reason="field changed/replaced; not overwritten"};S.owned=nil;return false end
- local ok,e=pcall(write,f,owned.original);S.restore={ok=ok,reason=ok and nil or tostring(e)};if ok then S.owned=nil end;record("restore",S.restore);return ok
-end
-local frame,status,requested,seconds,jsonBox
-local function tell(msg)status.Text=tostring(msg):sub(1,420)end
-local function export()
- local report={schemaVersion=1,version="1.0.0",runId=S.runId,startedAt=S.startedAt,endedAt=S.endedAt,placeId=game.PlaceId,jobId=game.JobId,requested=S.requested,windowSeconds=S.seconds,initial=S.initial,final=S.final,phases=S.phases,comparison=S.comparison,verdict=S.verdict,invalidations=S.invalidations,restore=S.restore,events=S.events,eventBytes=S.bytes,droppedEvents=S.dropped,payloadTruncations=S.truncated,limits={events=3000,eventBytes=2000000,remotes=100},limitations={"Local measurements do not prove server-side acceptance or a successful spoof.","Gain ratios are observations under assumed matched gameplay; action counts are not verified.","Only incoming events and visible state are recorded. Private server logic and outgoing requests are not inspected."}}
- local ok,p=pcall(function()return Http:JSONEncode(report)end);if not ok then tell("JSON export failed: "..tostring(p));return end
- S.report=report;S.json=p;jsonBox.Text=p
- local name="Slash-Friend-Boost-Probe-"..tostring(S.startedAt or now()).."-run"..S.runId..".json";S.export={name=name,verified=false}
- local wrote=false;if type(writefile)=="function"then wrote=pcall(writefile,name,p)end
- if wrote and type(readfile)=="function"then local readOK,bytes=pcall(readfile,name);S.export.verified=readOK and bytes==p end
- local copied=false;if type(setclipboard)=="function"then copied=pcall(setclipboard,p)end
- tell((S.verdict or "Stopped")..". "..(S.export.verified and "Saved and verified: "..name or wrote and "Written, readback unverified: "..name or copied and "JSON copied to clipboard"or "Use Show JSON to copy the report"))
-end
-local function disconnect()for _,c in ipairs(S.connections or {})do pcall(function()c:Disconnect()end)end;S.connections={}end
-local function finish(reason)
+-- Timestamp and sequence are assigned before asynchronous serialization.
+local function enqueue(kind,data,at)
  if not S.active then return end
- S.final=snapshot();S.endedAt=now();record("stop",{reason=reason});S.active=false;disconnect();if not restore()then invalidate("restore not confirmed")end
- if reason~="complete"or next(S.invalidations)then S.verdict="INCONCLUSIVE"end
- export()
+ S.seq=S.seq+1
+ if #S.pending>=LIMIT.queue then S.queueDropped=S.queueDropped+1;return end
+ local stamp=at or now()
+ S.pending[#S.pending+1]={sequence=S.seq,observedAt=stamp,elapsedMs=stamp-S.startedAt,kind=kind,data=data}
 end
-local function listen()
- local n=0;for _,remote in ipairs(RS:GetDescendants())do if remote:IsA("RemoteEvent")then if n>=100 then record("route_limit",{limit=100});break end;n=n+1;local source=remote;local ok,c=pcall(function()return source.OnClientEvent:Connect(function(...)if S.active then record("incoming_event",{route=source:GetFullName():sub(1,160),args=sanitize(table.pack(...)),direction="server-to-client-observed"})end end)end);if ok then S.connections[#S.connections+1]=c end end end
- record("routes_subscribed",{count=n,delivery="not yet observed"})
- for _,item in ipairs({{Players.PlayerAdded,"player_added"},{Players.PlayerRemoving,"player_removing"},{player.CharacterAdded,"character_changed"}})do local signal,kind=item[1],item[2];if signal then S.connections[#S.connections+1]=signal:Connect(function(p)if S.active then record(kind,{name=p and p.Name,boost=read(field())});invalidate(kind)end end)end end
-end
-local function phaseStart(name)
- local p={name=name,start=snapshot(),positive={},negative={},resets={},samples=0};S.phases[name]=p;S.phase=name;S.previous=p.start;S.phaseAt=now();tell(name.." — keep the same normal action running")
-end
-local function sample()
- local p=S.phases[S.phase];local current=snapshot();local prev=S.previous
- if not equivalent(S.initial.context,current.context)then invalidate("loadout/world changed")end
- local expected=S.phase=="local_test"and S.requested or S.original
- if current.boost~=expected then invalidate("boost changed or requested value did not hold")end
- for name,old in pairs(prev.stats)do local v=current.stats[name];if finite(v)then local d=v-old;if d>0 then p.positive[name]=(p.positive[name]or 0)+d elseif d<0 then p.negative[name]=(p.negative[name]or 0)+d;p.resets[name]=(p.resets[name]or 0)+1 end;if d~=0 then record("stat_change",{name=name,before=text(old),after=text(v),delta=text(d)})end end end
- p.samples=p.samples+1;S.previous=current
-end
-local function phaseEnd()
- local p=S.phases[S.phase];p.finish=snapshot();p.elapsedMs=p.finish.at-p.start.at;p.rates={}
- for name,amount in pairs(p.positive)do if p.elapsedMs>0 then p.rates[name]=amount/(p.elapsedMs/1000)end end
- record("phase_complete",{name=S.phase,positive=p.positive,negative=p.negative,samples=p.samples,elapsedMs=p.elapsedMs})
-end
-local function compare()
- S.comparison={tolerance=0.10,metrics={}};S.verdict="INCONCLUSIVE"
- if next(S.invalidations)then return end
- local a,b,c=S.phases.baseline,S.phases.local_test,S.phases.restored;local eligible=0;local difference=false
- for _,name in ipairs({"Power","Wins","Rebirths"})do
-  local ar,br,cr=a.rates[name],b.rates[name],c.rates[name]
-  if finite(ar)and finite(br)and finite(cr)and ar>0 and cr>0 and not a.resets[name]and not b.resets[name]and not c.resets[name]then
-   local limited=false;for _,p in ipairs({a,b,c})do if p.start.raw[name].limited or p.finish.raw[name].limited then limited=true end end
-   local stable=math.abs(ar-cr)/math.max(ar,cr)<=0.10
-   local ratio=br/((ar+cr)/2);S.comparison.metrics[name]={baselineRate=ar,testRate=br,restoredRate=cr,testRatio=ratio,controlsStable=stable,precisionLimited=limited}
-   if stable and not limited then eligible=eligible+1;if math.abs(ratio-1)>0.10 then difference=true end end
+local function drain()
+ local queue=S.pending;S.pending={}
+ for _,row in ipairs(queue) do
+  local ok,j=pcall(function() return HTTP:JSONEncode(row) end)
+  if ok and #S.events<LIMIT.events and S.eventBytes+#j<=LIMIT.bytes then
+   S.events[#S.events+1]=row;S.eventBytes=S.eventBytes+#j
+  else
+   S.dropped=S.dropped+1;if not ok then S.serializationErrors=S.serializationErrors+1 end
   end
  end
- if eligible>0 then S.verdict=difference and "OBSERVED_CHANGE_UNVERIFIED"or "NO_OBSERVABLE_EFFECT_IN_THIS_RUN"end
+end
+local STATS={"Power","Wins","Rebirths","Crystals"}
+local ATTRS={"FriendPowerPercent","PremiumPowerActive","CurrentWorld","EquippedSword","AuraMultiplier","PetMultiplier","SwordPowerMultiplier","SwordWinsMultiplier","SwordAttackSpeedMultiplier","PowerMultiplier","WinsMultiplier","AdminPowerMultiplier","AdminWinsMultiplier","AutoWin"}
+local function statObject(name)
+ for _,folder in ipairs({"NumericStats","PlayerStats"}) do
+  local root=player:FindFirstChild(folder);local x=root and root:FindFirstChild(name)
+  if x and x:IsA("ValueBase") and finite(x.Value) then return x end
+ end
+end
+local function scalar(v) if finite(v) or type(v)=="boolean" then return v end;if v~=nil then return safe(v) end end
+local function fingerprint(folderName,onlyEquipped)
+ local folder=player:FindFirstChild(folderName);if not folder then return "(missing)" end
+ local list={};local children=folder:GetChildren()
+ for i,x in ipairs(children) do
+  if i>LIMIT.inventory then trunc();break end
+  if not onlyEquipped or x:GetAttribute("Equipped")==true then
+   list[#list+1]=safe(x.Name,80).."="..(x:IsA("ValueBase") and safe(x.Value,80) or "")..":"..safe(x:GetAttribute("Multiplier"),80)..":"..safe(x:GetAttribute("MergeLevel"),30)
+  end
+ end
+ table.sort(list);local joined=table.concat(list,";");if #joined>20000 then trunc() end;return joined:sub(1,20000)
+end
+local function roster(exclude)
+ local list={}
+ for i,p in ipairs(Players:GetPlayers()) do
+  if i>200 then trunc();break end
+  if p~=exclude then list[#list+1]={userId=p.UserId,name=safe(p.Name,80)} end
+ end
+ table.sort(list,function(a,b)return a.userId<b.userId end)
+ return list
+end
+local function rosterKey(list) local ids={};for _,p in ipairs(list) do ids[#ids+1]=tostring(p.userId) end;return table.concat(ids,",") end
+local function snapshot()
+ local out={at=now(),stats={},raw={},context={},missingStats={}}
+ for _,name in ipairs(STATS) do
+  local x=statObject(name);local v=x and x.Value
+  if finite(v) then
+   out.stats[name]=v;out.raw[name]={value=number(v),precision="binary64",precisionLimited=math.abs(v)>9007199254740991,path=safe(x:GetFullName(),220)}
+  else out.missingStats[#out.missingStats+1]=name end
+ end
+ for _,name in ipairs(ATTRS) do out.context[name]=scalar(player:GetAttribute(name)) end
+ local ps=player:FindFirstChild("PlayerStats")
+ for _,name in ipairs({"AFKPad","AutoRebirth","EquippedAura"}) do local x=ps and ps:FindFirstChild(name);if x and x:IsA("ValueBase") then out.context[name]=scalar(x.Value) end end
+ out.context.EquippedCharms=fingerprint("EquippedCharms",false)
+ out.context.EquippedPets=fingerprint("PetInventory",true)
+ out.context.characterEpoch=S.characterEpoch
+ out.context.roster=S.rosterKey
+ return out
+end
+local function same(a,b)
+ for k,v in pairs(a) do if b[k]~=v then return false end end
+ for k,v in pairs(b) do if a[k]~=v then return false end end
+ return true
+end
+local function newSegment(snap,reason)
+ if S.segment then S.segment.endedAt=snap.at end
+ if #S.segments>=LIMIT.segments then S.segment=nil;S.segmentDropped=S.segmentDropped+1;return end
+ local seg={index=#S.segments+1,startedAt=snap.at,reason=reason,context=snap.context,positive={},negative={},resets={},changes={},precisionLimited={}}
+ S.segments[#S.segments+1]=seg;S.segment=seg
+end
+local function sample(reason)
+ local cur=snapshot();local prev=S.previous
+ if not prev then S.previous=cur;newSegment(cur,"start");return cur end
+ local changed=not same(prev.context,cur.context)
+ if changed then
+  enqueue("context_change",{reason=reason,before=prev.context,after=cur.context})
+  if prev.context.FriendPowerPercent~=cur.context.FriendPowerPercent then
+   enqueue("friend_boost_transition",{before=prev.context.FriendPowerPercent,after=cur.context.FriendPowerPercent,roster=S.roster})
+  end
+  newSegment(cur,reason)
+ end
+ for _,name in ipairs(STATS) do
+  local a,b=prev.stats[name],cur.stats[name]
+  if finite(a) and finite(b) and a~=b then
+   local d=b-a;local limited=(cur.raw[name] and cur.raw[name].precisionLimited) or (prev.raw[name] and prev.raw[name].precisionLimited)
+   enqueue("stat_change",{name=name,before=number(a),after=number(b),delta=number(d),precisionLimited=limited,source=reason,contextBoundary=changed})
+   local total=S.totals[name] or {positive=0,negative=0,changes=0,resets=0};S.totals[name]=total
+   total.changes=total.changes+1;total.precisionLimited=limited or total.precisionLimited
+   if d>0 then total.positive=total.positive+d else total.negative=total.negative+d;total.resets=total.resets+1 end
+   -- A delta crossing an observed context change belongs to neither comparison segment.
+   local seg=S.segment
+   if changed then S.boundaryDeltas=S.boundaryDeltas+1
+   elseif seg then
+    seg.changes[name]=(seg.changes[name] or 0)+1;seg.precisionLimited[name]=limited
+    if d>0 then seg.positive[name]=(seg.positive[name] or 0)+d
+    else seg.negative[name]=(seg.negative[name] or 0)+d;seg.resets[name]=(seg.resets[name] or 0)+1 end
+   end
+  elseif a~=b then enqueue("stat_availability",{name=name,before=prev.raw[name],after=cur.raw[name]}) end
+ end
+ S.previous=cur;return cur
+end
+local PAYLOAD={PunchRequest=true,PunchPowerFeedback=true,Effects=true,SlashSoundRequest=true,AFKExitRequest=true,AutoWinRequest=true,SettingsPreferenceRequest=true,RebirthRequest=true,MovementSpeedRequest=true}
+local function routePolicy(r)
+ if not r or typeof(r)~="Instance" or not (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) or not r:IsDescendantOf(RS) then return nil end
+ local parent=r.Parent
+ local payload=parent and parent.Name=="PunchEscapeRemotes" and parent.Parent==RS and PAYLOAD[r.Name]==true
+ return {path=safe(r:GetFullName(),220),class=r.ClassName,payloadPolicy=payload and "gameplay_arguments" or "metadata_only"}
+end
+local function argsData(args,payload)
+ local data={argumentCount=args.n}
+ if payload then
+  local limited={n=args.n};for i=1,math.min(args.n,24) do limited[i]=args[i] end
+  if args.n>24 then trunc();limited._truncated=true end
+  data.arguments=clean(limited)
+ end
+ return data
+end
+local function captureOutgoing(r,method,args)
+ local info=routePolicy(r);if not info then return end
+ local data=argsData(args,info.payloadPolicy=="gameplay_arguments")
+ data.route=info.path;data.class=info.class;data.method=method;data.payloadPolicy=info.payloadPolicy
+ S.outgoingObserved=S.outgoingObserved+1;enqueue("outgoing_request",data)
+end
+local function hook()
+ local shared=env[HOOK]
+ if type(shared)=="table" and shared.installed then
+  shared.dispatch=captureOutgoing;shared.owner=S;S.outgoingCapability="installed_reused";return
+ end
+ if type(hookmetamethod)~="function" or type(getnamecallmethod)~="function" then S.outgoingCapability="unsupported_executor";return end
+ shared={installed=false,dispatch=captureOutgoing,owner=S};local old
+ local getMethod=getnamecallmethod
+ local callback=function(self,...)
+  local ok,method=pcall(getMethod)
+  if ok and shared.dispatch and (method=="FireServer" or method=="InvokeServer") then
+   -- Observation failures must not suppress, repeat or change the original call.
+   local captured=pcall(shared.dispatch,self,method,table.pack(...))
+   if not captured and shared.owner then shared.owner.hookErrors=(shared.owner.hookErrors or 0)+1 end
+  end
+  return old(self,...)
+ end
+ if type(newcclosure)=="function" then local ok,c=pcall(newcclosure,callback);if ok and type(c)=="function" then callback=c end end
+ local ok,result=pcall(function()return hookmetamethod(game,"__namecall",callback)end)
+ if ok and type(result)=="function" then
+  old=result;shared.installed=true;env[HOOK]=shared;S.outgoingCapability="installed"
+ else
+  shared.dispatch=nil;shared.owner=nil;S.outgoingCapability="install_error";S.hookInstallError=safe(result)
+ end
+end
+local function track(conn) S.connections[#S.connections+1]=conn end
+local function addRoute(r)
+ local info=routePolicy(r);if not info or S.routeObjects[r] then return end
+ if #S.routes>=LIMIT.routes then S.routeLimitReached=true;return end
+ S.routeObjects[r]=true;S.routes[#S.routes+1]=info
+ info.incomingStatus=r:IsA("RemoteFunction") and "not_observed_remote_function_callback" or "pending"
+ if r:IsA("RemoteEvent") then
+  local generation=S.generation
+  local ok,c=pcall(function()return r.OnClientEvent:Connect(function(...)
+   if not S.active or S.generation~=generation then return end
+   local data=argsData(table.pack(...),info.payloadPolicy=="gameplay_arguments")
+   data.route=info.path;data.payloadPolicy=info.payloadPolicy
+   S.incomingObserved=S.incomingObserved+1;enqueue("incoming_event",data)
+  end)end)
+  if ok and c then info.incomingStatus="subscribed";track(c) else info.incomingStatus="subscription_error";info.error=safe(c) end
+ end
+ enqueue("route_inventory",info)
+end
+local function scanRoutes()
+ local root=RS:FindFirstChild("PunchEscapeRemotes")
+ if root then for _,name in ipairs({"PunchPowerFeedback","Effects","PunchRequest","SlashSoundRequest","AFKExitRequest","SettingsPreferenceRequest","RebirthRequest"}) do addRoute(root:FindFirstChild(name)) end end
+ for _,r in ipairs(RS:GetDescendants()) do addRoute(r) end
+ track(RS.DescendantAdded:Connect(function(r)if S.active then addRoute(r) end end))
+end
+local function bindStats()
+ for _,name in ipairs(STATS) do
+  local x=statObject(name)
+  if x and not S.boundStats[x] and S.statBindings<128 then
+   S.boundStats[x]=true;S.statBindings=S.statBindings+1;local generation=S.generation
+   track(x.Changed:Connect(function()if S.active and S.generation==generation then sample("stat_signal:"..name) end end))
+  elseif x and not S.boundStats[x] then S.statListenerLimitReached=true
+  end
+ end
+ local ps=player:FindFirstChild("PlayerStats")
+ for _,name in ipairs({"AFKPad","AutoRebirth","EquippedAura"}) do
+  local x=ps and ps:FindFirstChild(name)
+  if x and x:IsA("ValueBase") and not S.boundStats[x] and S.statBindings<128 then
+   S.boundStats[x]=true;S.statBindings=S.statBindings+1;local generation=S.generation
+   track(x.Changed:Connect(function()if S.active and S.generation==generation then sample("setting_signal:"..name) end end))
+  elseif x and not S.boundStats[x] then S.statListenerLimitReached=true end
+ end
+end
+local function disconnect()
+ for _,c in ipairs(S.connections) do pcall(function()c:Disconnect()end) end;S.connections={}
+ local shared=env[HOOK];if type(shared)=="table" and shared.owner==S then shared.dispatch=nil;shared.owner=nil end
+end
+local function summary()
+ for _,seg in ipairs(S.segments) do
+  local seconds=((seg.endedAt or S.endedAt or now())-seg.startedAt)/1000
+  seg.elapsedSeconds=seconds;seg.positiveRates={}
+  if seconds>0 then for name,gain in pairs(seg.positive) do seg.positiveRates[name]=gain/seconds end end
+ end
+end
+local function export()
+ if not S.startedAt then tell("Press Start first.");return end
+ if S.active then tell("Press Stop to finish and export this recording.");return end
+ summary()
+ local report={schemaVersion=2,version=S.version,runId=S.runId,startedAt=S.startedAt,endedAt=S.endedAt,placeId=game.PlaceId,jobId=game.JobId,
+  initial=S.initial,final=S.final,initialRoster=S.initialRoster,finalRoster=S.roster,events=S.events,segments=S.segments,totals=S.totals,
+  coverage={outgoingCapability=S.outgoingCapability,outgoingObserved=S.outgoingObserved,incomingObserved=S.incomingObserved,hookErrors=S.hookErrors,hookInstallError=S.hookInstallError,routes=S.routes,routeLimitReached=S.routeLimitReached,statListenerLimitReached=S.statListenerLimitReached,statListeners="Changed signals with 250ms replacement/context polling"},
+  retention={eventBytes=S.eventBytes,droppedEvents=S.dropped,queueDropped=S.queueDropped,serializationErrors=S.serializationErrors,payloadTruncations=S.truncated,segmentsDropped=S.segmentDropped,boundaryDeltasExcludedFromSegments=S.boundaryDeltas,limits=LIMIT},
+  conclusion="OBSERVATIONS_ONLY_NO_SPOOF_ESTABLISHED",
+  limitations={"Client-visible observations only; private server code, friendship checks and calculations are unavailable.","An installed namecall observer is not proof of complete coverage: direct function calls, replaced hooks, other runtimes and calls outside the recording can be missed.","Incoming RemoteFunction callbacks and returned InvokeServer results are not intercepted. RemoteEvent subscription is distinct from message delivery.","Known gameplay routes retain bounded arguments; other ReplicatedStorage routes retain metadata only. Values may be truncated and credentials redacted.","No fields are edited or requests fired/replayed. Client callbacks and stats are observations, not authenticated proof of server awards or persistence.","Segments split on observed roster/boost/loadout/training changes; boundary deltas are excluded. Polling can miss brief changes. Rates are descriptive, not causal proof.","Large counters use binary64 precision; rounding, resets, batching, unobserved inputs and simultaneous events can confound comparisons."}}
+ local ok,j=pcall(function()return HTTP:JSONEncode(report)end)
+ if not ok then tell("Report encoding failed. Recording remains in memory: "..safe(j));return end
+ S.report=report;S.json=j;jsonBox.Text=j
+ local name="Slash-Friend-Boost-Observer-"..tostring(S.startedAt).."-run"..S.runId..".json"
+ local wrote=type(writefile)=="function" and pcall(writefile,name,j) or false
+ local verified=false
+ if wrote and type(readfile)=="function" then local readOK,bytes=pcall(readfile,name);verified=readOK and bytes==j end
+ local copied=type(setclipboard)=="function" and pcall(setclipboard,j) or false
+ S.export={name=name,written=wrote,verified=verified,clipboard=copied}
+ tell((verified and "Saved and verified: "..name or wrote and "Written; readback not verified: "..name or copied and "File unavailable. JSON copied to clipboard." or "File/clipboard unavailable. Use Show JSON to copy.").." Outgoing: "..tostring(S.outgoingCapability).." ("..S.outgoingObserved.." observed).")
+end
+local function stop(reason)
+ if not S.active then return end
+ S.final=sample("final");S.endedAt=now();if S.segment then S.segment.endedAt=S.endedAt end
+ enqueue("stop",{reason=reason or "manual"});drain();S.active=false;disconnect();export()
 end
 local function start()
- if S.active then tell("Test already running");return end
- local value,window=tonumber(requested.Text),tonumber(seconds.Text);local f=field()
- if not finite(value)or not finite(window)or window<1 or window>60 then tell("Enter a finite boost and window of 1–60 seconds");return end
- if not f then tell("Existing numeric FriendPowerPercent was not found");return end
- if S.owned and not restore()then tell("Prior edit could not be restored; close and review the report");return end
- S.runId=S.runId+1;local ticket=S.runId;S.active=true;S.startedAt=now();S.endedAt=nil;S.requested=value;S.seconds=window;S.original=read(f);S.initial=snapshot();S.final=nil;S.events={};S.phases={};S.invalidations={};S.connections={};S.seq=0;S.bytes=0;S.dropped=0;S.truncated=0;S.restore=nil;S.verdict="INCONCLUSIVE";S.comparison=nil
- listen();phaseStart("baseline")
+ if S.active then tell("Recording already running.");return end
+ S.generation=S.generation+1;S.runId=S.runId+1;S.startedAt=now();S.endedAt=nil;S.final=nil;S.report=nil;S.json=nil;S.export=nil
+ S.events={};S.pending={};S.routes={};S.routeObjects={};S.boundStats={};S.segments={};S.segment=nil;S.previous=nil;S.totals={};S.connections={}
+ S.seq=0;S.eventBytes=0;S.dropped=0;S.queueDropped=0;S.serializationErrors=0;S.truncated=0;S.segmentDropped=0;S.boundaryDeltas=0
+ S.incomingObserved=0;S.outgoingObserved=0;S.hookErrors=0;S.hookInstallError=nil;S.routeLimitReached=false
+ S.characterEpoch=0;S.statBindings=0;S.statListenerLimitReached=false
+ S.roster=roster();S.rosterKey=rosterKey(S.roster);S.initialRoster=S.roster;S.active=true;jsonBox.Text="";jsonBox.Visible=false
+ S.initial=sample("start");enqueue("start",{initial=S.initial,roster=S.roster})
+ hook();scanRoutes();bindStats()
+ local generation=S.generation
+ for _,name in ipairs(ATTRS) do track(player:GetAttributeChangedSignal(name):Connect(function()if S.active and S.generation==generation then sample("attribute:"..name) end end)) end
+ track(Players.PlayerAdded:Connect(function(p)
+  if not S.active then return end;S.roster=roster();S.rosterKey=rosterKey(S.roster)
+  enqueue("player_added",{userId=p.UserId,name=safe(p.Name,80),relationship="unknown"});sample("player_added")
+ end))
+ track(Players.PlayerRemoving:Connect(function(p)
+  if not S.active then return end;S.roster=roster(p);S.rosterKey=rosterKey(S.roster)
+  enqueue("player_removing",{userId=p.UserId,name=safe(p.Name,80),relationship="unknown"});sample("player_removing")
+ end))
+ track(player.CharacterAdded:Connect(function()if S.active then S.characterEpoch=S.characterEpoch+1;enqueue("character_changed",{});sample("character_changed") end end))
+ tell("Recording. Train normally; have the friend join AND leave, then Stop. Outgoing: "..S.outgoingCapability)
  task.spawn(function()
-  local ok,err=pcall(function()
-   for _,phase in ipairs({"baseline","local_test","restored"})do
-    if not S.active or S.runId~=ticket then return end
-    if phase=="local_test"then
-     if not same(f,field())or read(f)~=S.original then invalidate("boost/field changed during baseline");finish("baseline changed");return end
-     write(f,value);S.owned={field=f,original=S.original,observed=read(f)};record("local_write",{before=S.original,requested=value,observed=read(f)})
-    elseif phase=="restored"then if not restore()then invalidate("restore not confirmed")end end
-    if phase~="baseline"then phaseStart(phase)end
-    while now()-S.phaseAt<window*1000 do task.wait(.25);if not S.active or S.runId~=ticket then return end;sample()end
-    phaseEnd()
-   end
-   compare();finish("complete")
-  end)
-  if not ok and S.runId==ticket then invalidate("runtime failure: "..tostring(err));finish("runtime error")end
+  local heartbeat=now()
+  while S.active and S.generation==generation do
+   task.wait(.25)
+   if not S.active or S.generation~=generation then return end
+   local ok,e=pcall(function()
+    bindStats();local current=sample("poll")
+    if now()-heartbeat>=2000 then heartbeat=now();enqueue("heartbeat",{stats=current.raw,context=current.context,outgoingObserved=S.outgoingObserved,incomingObserved=S.incomingObserved}) end
+    drain()
+   end)
+   if not ok then enqueue("observer_error",{message=safe(e)});stop("observer_error");return end
+  end
  end)
 end
-local gui=Instance.new("ScreenGui");gui.Name="SlashFriendBoostProbe";gui.ResetOnSpawn=false;gui.Parent=player:WaitForChild("PlayerGui");S.ui=gui
-frame=Instance.new("Frame");frame.Size=UDim2.fromOffset(540,280);frame.Position=UDim2.new(.5,-270,.5,-140);frame.Visible=true;frame.Parent=gui
-local function control(class,name,label,x,y,w,h)local c=Instance.new(class);c.Name=name;c.Text=label;c.Position=UDim2.fromOffset(x,y);c.Size=UDim2.fromOffset(w,h);c.Parent=frame;return c end
-control("TextLabel","Title","FRIEND BOOST — NORMAL / EDITED / RESTORED",10,0,480,32)
-status=control("TextLabel","Status","Idle. Keep the same normal action running throughout the test.",10,35,520,60);status.TextWrapped=true
-control("TextLabel","BoostLabel","Test friend boost",10,100,180,28);requested=control("TextBox","RequestedBoost","100000",210,100,180,28);requested.ClearTextOnFocus=false
-control("TextLabel","WindowLabel","Seconds per phase",10,135,180,28);seconds=control("TextBox","WindowSeconds","10",210,135,180,28);seconds.ClearTextOnFocus=false
-local a=control("TextButton","StartTest","Start test",10,180,110,30);local b=control("TextButton","StopTest","Stop test",130,180,110,30);local show=control("TextButton","ShowJSON","Show JSON",250,180,110,30)
-jsonBox=control("TextBox","ExportJSON","",10,35,520,130);jsonBox.Visible=false;jsonBox.MultiLine=true;jsonBox.ClearTextOnFocus=false;jsonBox.TextEditable=false
-local function guarded(fn)return function()local ok,e=pcall(fn);if not ok then tell("Error: "..tostring(e));if S.active then invalidate("control error");finish("control error")end end end end
-a.MouseButton1Click:Connect(guarded(start));b.MouseButton1Click:Connect(guarded(function()finish("manual stop")end));show.MouseButton1Click:Connect(guarded(function()jsonBox.Visible=not jsonBox.Visible;if jsonBox.Visible then export()end end))
-local toggle=Instance.new("TextButton");toggle.Name="Toggle";toggle.Size=UDim2.fromOffset(160,28);toggle.Position=UDim2.fromOffset(10,45);toggle.Text="Hide/show boost probe";toggle.Parent=gui;toggle.MouseButton1Click:Connect(function()frame.Visible=not frame.Visible end)
-local close=control("TextButton","Close","×",500,0,30,28);close.MouseButton1Click:Connect(guarded(function()if S.active then finish("closed")end;restore();disconnect();S.running=false;env.SlashFriendBoostProbeLast=S;env[KEY]=nil;gui:Destroy()end))
+local gui=Instance.new("ScreenGui");gui.Name="SlashFriendBoostProbe";gui.ResetOnSpawn=false;gui.Parent=player:WaitForChild("PlayerGui")
+frame=Instance.new("Frame");frame.Name="Panel";frame.Size=UDim2.fromOffset(560,310);frame.Position=UDim2.new(.5,-280,.5,-155);frame.Parent=gui
+local function control(class,name,label,x,y,w,h)
+ local c=Instance.new(class);c.Name=name;c.Text=label;c.Position=UDim2.fromOffset(x,y);c.Size=UDim2.fromOffset(w,h);c.Parent=frame;return c
+end
+control("TextLabel","Title","FRIEND BOOST OBSERVER 2 — START / STOP",10,5,500,30)
+status=control("TextLabel","Status","Idle. Observes requests and gains. Does not edit the boost or access private server code.",10,40,540,75);status.TextWrapped=true
+local a=control("TextButton","StartTest","Start",10,120,100,32)
+local b=control("TextButton","StopTest","Stop + save",120,120,120,32)
+local show=control("TextButton","ShowJSON","Show JSON",250,120,120,32)
+jsonBox=control("TextBox","ExportJSON","",10,165,540,135);jsonBox.Visible=false;jsonBox.MultiLine=true;jsonBox.ClearTextOnFocus=false;jsonBox.TextEditable=false
+local function guarded(fn)
+ return function()
+  local ok,e=pcall(fn)
+  if not ok then
+   tell("Observer error: "..safe(e))
+   if S.active then local stopped=pcall(stop,"control_error");if not stopped then S.active=false;disconnect() end end
+  end
+ end
+end
+a.MouseButton1Click:Connect(guarded(start));b.MouseButton1Click:Connect(guarded(function()stop("manual")end))
+show.MouseButton1Click:Connect(guarded(function()if S.active then tell("Stop before exporting.");return end;if not S.json then export() end;jsonBox.Visible=not jsonBox.Visible end))
+local toggle=Instance.new("TextButton");toggle.Name="Toggle";toggle.Text="Hide/show observer";toggle.Size=UDim2.fromOffset(170,28);toggle.Position=UDim2.fromOffset(10,42);toggle.Parent=gui
+toggle.MouseButton1Click:Connect(function()frame.Visible=not frame.Visible end)
+local close=control("TextButton","Close","×",520,5,30,28)
+close.MouseButton1Click:Connect(guarded(function()stop("closed");disconnect();S.running=false;env.SlashFriendBoostProbeLast=S;env[KEY]=nil;gui:Destroy()end))
 S.focus=function()frame.Visible=true end
-print("Friend boost probe loaded. Local edits are not proof of server-side reward effects.")
+print("Friend Boost Observer 2 loaded. Start/Stop; no edits or replay. Live coverage is reported, not assumed.")
