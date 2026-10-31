@@ -1,4 +1,6 @@
-# Slash modifier experiment (v2)
+# Slash modifier experiment (v2.0.1)
+
+v2.0.1 corrects a live-capture failure where pressing a Start button saved its snapshot but then attempted to display a nonexistent end-result object. Regression checks now also reject unexpected GUI callback errors throughout the measurement sequence. Existing open v2.0.0 panels must be closed and the script reloaded to get the correction.
 
 This is a separate diagnostic Lua script. It is not part of Slash and it does not claim that a client-side value changes server rewards.
 

@@ -1,4 +1,4 @@
--- Slash Modifier Experiment v2.0 (diagnostic only)
+-- Slash Modifier Experiment v2.0.1 (diagnostic only)
 -- Edits only existing replicated client fields; never fires remotes or claims server success.
 local Players=game:GetService("Players")
 local Http=game:GetService("HttpService")
@@ -10,7 +10,7 @@ if type(old)=="table" and old.running and old.focus then pcall(old.focus);print(
 if type(old)=="table" and old.running==false then env[KEY]=nil end
 if type(env.SlashModifierRecorder)=="table" and env.SlashModifierRecorder.running then env.SlashModifierRecorder.running=false end
 local NOW=function()return DateTime.now().UnixTimestampMillis end
-local state={version="2.0.0",running=true,startedAt=NOW(),events={},writes={},trials={},trialStages={},originals={},lastWrites={},connections={},ui=nil,droppedWrites=0,droppedTrials=0}
+local state={version="2.0.1",running=true,startedAt=NOW(),events={},writes={},trials={},trialStages={},originals={},lastWrites={},connections={},ui=nil,droppedWrites=0,droppedTrials=0}
 env[KEY]=state
 local baseFactorNames={"FriendPowerPercent","AuraMultiplier","SwordPowerMultiplier","SwordWinsMultiplier","SwordAttackSpeedMultiplier","AdminPowerMultiplier","AdminWinsMultiplier","PetMultiplier","PowerMultiplier","WinsMultiplier"}
 local factorNames={};for _,n in ipairs(baseFactorNames)do factorNames[#factorNames+1]=n end
@@ -158,7 +158,7 @@ local show=button("Show JSON",220,trialControls)
 local jsonBox=Instance.new("TextBox");jsonBox.Name="ExportJSON";jsonBox.Size=UDim2.new(1,-20,0,300);jsonBox.Position=UDim2.fromOffset(10,82);jsonBox.MultiLine=true;jsonBox.ClearTextOnFocus=false;jsonBox.TextEditable=false;jsonBox.TextSize=12;jsonBox.TextXAlignment=Enum.TextXAlignment.Left;jsonBox.TextYAlignment=Enum.TextYAlignment.Top;jsonBox.Visible=false;jsonBox.Parent=frame
 show.MouseButton1Click:Connect(function()callback(function()if jsonBox.Visible then jsonBox.Visible=false;scroll.Visible=true;show.Text="Show JSON"else local p,msg=export();if p then jsonBox.Text=p;jsonBox.Visible=true;scroll.Visible=false;show.Text="Hide JSON"end;setStatus(msg)end end)end)
 local function stage(label)
- callback(function()local s,d=captureStage(label);if #state.trials<100 then state.trials[#state.trials+1]={label=label,at=NOW(),snapshot=s,deltas=d}else state.droppedTrials=state.droppedTrials+1 end;local result=state.trialStages[label:gsub("_end$","_result")];local text=label.." captured. Perform the matched action, then press End.";if result then local p=result.stats.Power;local w=result.stats.Wins;text=result.window.." observed: Power "..(p and p.delta or "unavailable").."; Wins "..(w and w.delta or "unavailable")..". Server effect unverified."end;setStatus(text)end)
+ callback(function()local s,d=captureStage(label);if #state.trials<100 then state.trials[#state.trials+1]={label=label,at=NOW(),snapshot=s,deltas=d}else state.droppedTrials=state.droppedTrials+1 end;local result=label:match("_end$") and state.trialStages[label:gsub("_end$","_result")] or nil;local text=label.." captured. Perform the matched action, then press End.";if result then local p=result.stats.Power;local w=result.stats.Wins;text=result.window.." observed: Power "..(p and p.delta or "unavailable").."; Wins "..(w and w.delta or "unavailable")..". Server effect unverified."end;setStatus(text)end)
 end
 baselineStart.MouseButton1Click:Connect(function()stage("baseline_start")end);baselineEnd.MouseButton1Click:Connect(function()stage("baseline_end")end);modifiedStart.MouseButton1Click:Connect(function()stage("modified_start")end);modifiedEnd.MouseButton1Click:Connect(function()stage("modified_end")end)
 restore.MouseButton1Click:Connect(function()callback(function()restoreAll();setStatus("Restore results recorded; changed/replaced fields were left untouched.")end)end)
